@@ -1,0 +1,8 @@
+* text=auto eol=lf
+
+*.png  binary
+*.jpg  binary
+*.ipa  binary
+*.p12  binary
+*.mobileprovision binary
+*.car  binary

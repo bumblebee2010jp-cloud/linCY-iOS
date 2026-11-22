@@ -1,0 +1,168 @@
+name: unsigned-ipa
+
+on:
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: '构建配置'
+        required: true
+        default: 'Release'
+        type: choice
+        options:
+          - Release
+          - Debug
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: unsigned-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 30
+    env:
+      PROJECT: linCY.xcodeproj
+      SCHEME: linCY
+      CONFIG: ${{ inputs.configuration || 'Release' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 选择 Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '15.4'
+
+      - name: 环境自检
+        run: |
+          set -euo pipefail
+          echo "== Xcode =="
+          xcodebuild -version
+          echo "== iOS SDK =="
+          xcrun --sdk iphoneos --show-sdk-version
+          echo "== 工程与 Scheme =="
+          xcodebuild -list -project "$PROJECT"
+          echo "== Scheme 内可用配置 =="
+          xcodebuild -showBuildSettings -project "$PROJECT" -scheme "$SCHEME" -configuration "$CONFIG" 2>/dev/null \
+            | grep -E 'PRODUCT_BUNDLE_IDENTIFIER|MARKETING_VERSION|CURRENT_PROJECT_VERSION|IPHONEOS_DEPLOYMENT_TARGET|SWIFT_VERSION|TARGETED_DEVICE_FAMILY' || true
+
+      - name: 构建（关闭代码签名）
+        run: |
+          set -euo pipefail
+          rm -rf build
+          xcodebuild \
+            -project "$PROJECT" \
+            -scheme "$SCHEME" \
+            -configuration "$CONFIG" \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            ONLY_ACTIVE_ARCH=NO \
+            ENABLE_BITCODE=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            EXPANDED_CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            clean build
+
+      - name: 打包未签名 ipa
+        id: pack
+        run: |
+          set -euo pipefail
+
+          APP=$(find build/Build/Products -maxdepth 2 -type d -name "*.app" | head -1)
+          if [ -z "$APP" ]; then
+            echo "::error::未找到 .app 产物，构建可能失败"
+            exit 1
+          fi
+          echo "产物: $APP"
+
+          # 清掉可能残留的签名，避免手机端工具误判
+          rm -rf "$APP/_CodeSignature"
+          rm -f  "$APP/embedded.mobileprovision"
+
+          APP_NAME=$(basename "$APP" .app)
+          VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP/Info.plist")
+          BUILD_NO=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$APP/Info.plist")
+          BUNDLE_ID=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP/Info.plist")
+          EXEC=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP/Info.plist")
+
+          rm -rf stage && mkdir -p stage/Payload
+          cp -R "$APP" stage/Payload/
+          cd stage
+          OUT="../${APP_NAME}-${VERSION}-${BUILD_NO}-${CONFIG}-unsigned.ipa"
+          zip -qry -y "$OUT" Payload -x "*.DS_Store" -x "__MACOSX/*" -x "*/._*"
+          cd ..
+
+          IPA=$(ls -t "${APP_NAME}"-*-unsigned.ipa | head -1)
+          echo "ipa: $IPA"
+
+          echo "== 结构校验 =="
+          unzip -l "$IPA" | grep -E "Payload/[^/]+\.app/(${EXEC})$|Payload/[^/]+\.app/Info.plist" \
+            || { echo "::error::ipa 结构异常，缺主二进制或 Info.plist"; exit 1; }
+          if unzip -l "$IPA" | grep -q "_CodeSignature"; then
+            echo "::warning::ipa 内仍存在 _CodeSignature，手机端签名工具可能拒绝覆盖"
+          else
+            echo "已确认未签名（无 _CodeSignature）"
+          fi
+
+          echo "== 架构 =="
+          lipo -info "stage/Payload/$APP_NAME.app/$EXEC"
+
+          echo "== 大小 =="
+          du -h "$IPA"
+
+          shasum -a 256 "$IPA" | tee "${IPA}.sha256"
+
+          echo "ipa_path=${IPA}" >> "$GITHUB_OUTPUT"
+          echo "app_name=${APP_NAME}" >> "$GITHUB_OUTPUT"
+          echo "bundle_id=${BUNDLE_ID}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}-${BUILD_NO}" >> "$GITHUB_OUTPUT"
+
+      - name: 上传 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pack.outputs.app_name }}-${{ steps.pack.outputs.version }}-unsigned
+          path: |
+            ${{ steps.pack.outputs.ipa_path }}
+            ${{ steps.pack.outputs.ipa_path }}.sha256
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: 附带发布到 Release（仅打 tag 时）
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ steps.pack.outputs.ipa_path }}
+            ${{ steps.pack.outputs.ipa_path }}.sha256
+          body: |
+            未签名 ipa，可直接在手机上用签名工具安装。
+
+            - Bundle ID: `${{ steps.pack.outputs.bundle_id }}`
+            - 版本: `${{ steps.pack.outputs.version }}`
+            - 构建配置: `${{ env.CONFIG }}`
+            - 架构: arm64
+
+      - name: 结果摘要
+        run: |
+          {
+            echo "### 构建完成"
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "|---|---|"
+            echo "| 产物 | \`${{ steps.pack.outputs.ipa_path }}\` |"
+            echo "| Bundle ID | \`${{ steps.pack.outputs.bundle_id }}\` |"
+            echo "| 版本 | \`${{ steps.pack.outputs.version }}\` |"
+            echo "| 配置 | \`${CONFIG}\` |"
+            echo "| 签名 | 未签名（待手机端签名） |"
+          } >> "$GITHUB_STEP_SUMMARY"
