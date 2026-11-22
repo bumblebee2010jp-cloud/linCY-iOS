@@ -218,13 +218,15 @@ final class BackupManager: NSObject, ObservableObject, URLSessionDataDelegate {
         var result: Result<Bool, Error>
         if let error { result = .failure(error) }
         else if let response = task.response as? HTTPURLResponse,
-                [200, 201].contains(response.statusCode),
-                let json = (try? JSONSerialization.jsonObject(with: responseBody)) as? [String: Any],
-                json["name"] is String, json["size"] is NSNumber || json["skipped"] as? Bool == true {
-            result = .success(json["skipped"] as? Bool == true)
+                (200..<300).contains(response.statusCode) {
+            // 2xx 即表示服务器已接收该文件。响应体只用来识别「服务器已存在此文件」，
+            // 缺字段或空 body（例如 201 且无返回内容）不应判为失败。
+            let json = (try? JSONSerialization.jsonObject(with: responseBody)) as? [String: Any]
+            result = .success(json?["skipped"] as? Bool == true)
         } else {
             let code = (task.response as? HTTPURLResponse)?.statusCode ?? 0
-            result = .failure(AppError.message("上传 HTTP \(code)：\(String(data: responseBody.prefix(300), encoding: .utf8) ?? "响应无效")"))
+            let body = String(data: responseBody.prefix(300), encoding: .utf8) ?? ""
+            result = .failure(AppError.message("上传 HTTP \(code)：\(body.isEmpty ? "服务端未返回内容" : body)"))
         }
         cleanPending()
         responseBody = Data()

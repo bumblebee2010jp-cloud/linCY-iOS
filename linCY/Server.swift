@@ -109,7 +109,12 @@ struct Server {
             URLQueryItem(name: "album", value: album), URLQueryItem(name: "name", value: name)
         ], cookie: cookie))
         struct Check: Decodable { let exists: Bool }
-        return try JSONDecoder().decode(Check.self, from: data).exists
+        guard let check = try? JSONDecoder().decode(Check.self, from: data) else {
+            // 响应不是 {"exists":bool}（空 body 或字段名不同）时不阻断整轮备份：
+            // 按「服务器没有」处理，由上传接口的 conflict=skip 负责去重。
+            return false
+        }
+        return check.exists
     }
 
     func uploadRequest(album: String, name: String, cookie: String, size: Int64) -> URLRequest {
