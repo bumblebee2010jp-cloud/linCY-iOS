@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import UniformTypeIdentifiers
 
 enum AlbumSource: String, CaseIterable, Identifiable {
     case local = "本机相册"
@@ -8,21 +9,15 @@ enum AlbumSource: String, CaseIterable, Identifiable {
 }
 
 enum SyncRequest: Identifiable {
-    case all
-    case album(String)
+    case albums([String])
 
-    var id: String {
-        switch self {
-        case .all: return "__all__"
-        case .album(let name): return name
-        }
-    }
+    var id: String { albums.joined(separator: "|") }
+    var targets: [String] { albums }
 
     var title: String {
-        switch self {
-        case .all: return "同步全部服务器相册？"
-        case .album(let name): return "同步「\(name)」到手机相册？"
-        }
+        albums.count == 1
+            ? "同步「\(albums[0])」到手机相册？"
+            : "同步选中的 \(albums.count) 个相册？"
     }
 }
 
@@ -47,6 +42,7 @@ struct LinCYApp: App {
 
 struct ContentView: View {
     @StateObject private var backup = BackupManager.shared
+    @StateObject private var folderBackup = FolderBackupManager.shared
     @AppStorage("serverAddress") private var address = ""
     @AppStorage("wifiOnly") private var wifiOnly = true
     @State private var draft = ""
@@ -54,6 +50,8 @@ struct ContentView: View {
     @State private var showHiddenAlbums = false
     @State private var albumSource: AlbumSource = .local
     @State private var syncRequest: SyncRequest?
+    @State private var selectedRemote: Set<String> = []
+    @State private var showFolderPicker = false
     @State private var connectionStatus = ""
     @State private var connecting = false
     @State private var webToken = UUID()
@@ -146,20 +144,38 @@ struct ContentView: View {
                         } else {
                             ForEach(backup.remoteAlbums, id: \.self) { name in
                                 Button {
-                                    syncRequest = .album(name)
+                                    if selectedRemote.contains(name) { selectedRemote.remove(name) }
+                                    else { selectedRemote.insert(name) }
                                 } label: {
                                     HStack {
-                                        Image(systemName: "folder")
+                                        Image(systemName: selectedRemote.contains(name)
+                                              ? "checkmark.circle.fill" : "circle")
                                         Text(name).foregroundStyle(.primary).lineLimit(1)
                                         Spacer()
-                                        Image(systemName: "arrow.down.circle")
-                                            .foregroundStyle(.tint)
                                     }
                                 }
                                 .disabled(backup.running || backup.restoring)
                             }
+                            HStack {
+                                Button {
+                                    syncRequest = .albums(Array(selectedRemote).sorted())
+                                } label: {
+                                    Label("同步选中（\(selectedRemote.count)）",
+                                          systemImage: "arrow.down.circle")
+                                }
+                                .disabled(selectedRemote.isEmpty || backup.running || backup.restoring)
+                                Spacer()
+                                Button(selectedRemote.count == backup.remoteAlbums.count ? "取消全选" : "全选") {
+                                    if selectedRemote.count == backup.remoteAlbums.count {
+                                        selectedRemote.removeAll()
+                                    } else {
+                                        selectedRemote = Set(backup.remoteAlbums)
+                                    }
+                                }
+                                .disabled(backup.running)
+                            }
                             Button {
-                                syncRequest = .all
+                                syncRequest = .albums(backup.remoteAlbums)
                             } label: {
                                 Label("同步全部（\(backup.remoteAlbums.count) 个相册）",
                                       systemImage: "arrow.down.circle.fill")
@@ -216,6 +232,67 @@ struct ContentView: View {
                         Text("对比服务器与手机相册，只下载手机里没有的文件；手机上缺的同名相册会自动新建。")
                     }
             }.tabItem { Label("相册备份", systemImage: "photo.on.rectangle.angled") }
+            NavigationStack {
+                List {
+                    Section {
+                        Text(folderBackup.status)
+                        if folderBackup.running { ProgressView(value: folderBackup.progress) }
+                        Text("上传 \(folderBackup.uploaded) · 跳过 \(folderBackup.skipped) · 失败 \(folderBackup.failed)")
+                            .font(.footnote).foregroundStyle(.secondary)
+                        if folderBackup.running {
+                            HStack(spacing: 8) {
+                                ProgressView()
+                                Text("正在同步，请保持此页在前台").font(.footnote).foregroundStyle(.secondary)
+                            }
+                        } else {
+                            Button {
+                                Task { await folderBackup.startSync(address: address,
+                                    password: Credentials.password(for: address), wifiOnly: wifiOnly) }
+                            } label: { Label("开始同步", systemImage: "arrow.triangle.2.circlepath") }
+                                .disabled(address.isEmpty || folderBackup.folders.isEmpty)
+                        }
+                    } footer: {
+                        Text("以手机文件夹为准，把内容（含所有子文件夹）上传到服务器「备份文件」根目录下的同名文件夹，服务器没有就新建。大小没变化的文件会跳过。")
+                    }
+
+                    Section {
+                        Button {
+                            showFolderPicker = true
+                        } label: { Label("添加手机文件夹", systemImage: "folder.badge.plus") }
+                            .disabled(folderBackup.running)
+                        ForEach(folderBackup.folders) { folder in
+                            HStack(spacing: 10) {
+                                Image(systemName: "folder.fill").foregroundStyle(.tint)
+                                Text(folder.displayName)
+                                Spacer()
+                            }
+                            .contextMenu {
+                                Button(role: .destructive) {
+                                    folderBackup.remove(folder.id)
+                                } label: { Label("移除", systemImage: "trash") }
+                            }
+                        }
+                    } header: {
+                        Text("手机文件夹（\(folderBackup.folders.count)）")
+                    } footer: {
+                        Text("可添加多个文件夹，长按可移除。移除只取消同步，不会删除手机或服务器上的文件。")
+                    }
+
+                    if !folderBackup.logs.isEmpty {
+                        Section("本次记录") {
+                            ForEach(Array(folderBackup.logs.enumerated()), id: \.offset) { _, text in
+                                Text(text).font(.caption).textSelection(.enabled)
+                            }
+                        }
+                    }
+                }
+                .navigationTitle("文件夹备份")
+                .sheet(isPresented: $showFolderPicker) {
+                    FolderPicker { url in
+                        _ = folderBackup.addFolder(url)
+                    }
+                }
+            }.tabItem { Label("文件夹备份", systemImage: "folder") }
             NavigationStack {
                 Form {
                     Section("电脑上的 linCY 服务") {
@@ -284,5 +361,39 @@ struct ContentView: View {
             webToken = UUID()
             connectionStatus = "连接成功，已保存"
         } catch { connectionStatus = error.localizedDescription }
+    }
+}
+
+/// 系统文件夹选择器。iOS 只能选文件夹，返回 security-scoped URL，
+/// 由 FolderBackupManager 转成 bookmark 以便长期访问。
+struct FolderPicker: UIViewControllerRepresentable {
+    let onPick: (URL) -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.folder], asCopy: false)
+        picker.allowsMultipleSelection = false
+        picker.shouldShowFileExtensions = true
+        picker.delegate = context.coordinator
+        return picker
+    }
+
+    func updateUIViewController(_ controller: UIDocumentPickerViewController, context: Context) {}
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    final class Coordinator: NSObject, UIDocumentPickerDelegate {
+        private let parent: FolderPicker
+        init(_ parent: FolderPicker) { self.parent = parent }
+
+        func documentPicker(_ controller: UIDocumentPickerViewController,
+                            didPickDocumentsAt urls: [URL]) {
+            if let url = urls.first { parent.onPick(url) }
+            parent.dismiss()
+        }
+
+        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+            parent.dismiss()
+        }
     }
 }

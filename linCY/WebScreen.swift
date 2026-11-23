@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import UniformTypeIdentifiers
 import WebKit
 
 struct SharedFile: Identifiable { let id = UUID(); let url: URL }
@@ -50,7 +51,8 @@ struct WebContent: UIViewRepresentable {
     }
     func updateUIView(_ web: WKWebView, context: Context) {}
 
-    final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate {
+    final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate,
+                             UIDocumentPickerDelegate {
         let parent: WebContent
         var downloads: [ObjectIdentifier: URL] = [:]
         init(_ parent: WebContent) { self.parent = parent }
@@ -121,6 +123,49 @@ struct WebContent: UIViewRepresentable {
             var controller = webView.window?.rootViewController
             while let presented = controller?.presentedViewController { controller = presented }
             return controller
+        }
+
+        // MARK: - 网页里的文件 / 文件夹选择
+
+        private var filePickerCompletion: (([URL]?) -> Void)?
+
+        /// WKWebView 默认不处理 <input type="file">，必须由宿主 App 弹出选择器。
+        /// 这个方法在 iOS SDK 里没有公开声明，用 @objc 按 selector 名对上即可被 WebKit 调用。
+        @objc(webView:runOpenPanelWithParameters:initiatedByFrame:completionHandler:)
+        func webView(_ webView: WKWebView, runOpenPanelWithParameters parameters: AnyObject,
+                     initiatedByFrame frame: WKFrameInfo,
+                     completionHandler: @escaping ([URL]?) -> Void) {
+            var allowsDirectories = false
+            if let object = parameters as? NSObject,
+               object.responds(to: NSSelectorFromString("allowsDirectories")) {
+                allowsDirectories = (object.value(forKey: "allowsDirectories") as? Bool) ?? false
+            }
+
+            let types: [UTType] = allowsDirectories ? [.folder] : [.data]
+            let picker = UIDocumentPickerViewController(forOpeningContentTypes: types, asCopy: true)
+            picker.allowsMultipleSelection = false
+            picker.delegate = self
+
+            filePickerCompletion = completionHandler
+            guard let host = presenter(webView) else {
+                filePickerCompletion = nil
+                completionHandler(nil)
+                return
+            }
+            host.present(picker, animated: true)
+        }
+
+        func documentPicker(_ controller: UIDocumentPickerViewController,
+                            didPickDocumentsAt urls: [URL]) {
+            let completion = filePickerCompletion
+            filePickerCompletion = nil
+            completion?(urls.isEmpty ? nil : urls)
+        }
+
+        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+            let completion = filePickerCompletion
+            filePickerCompletion = nil
+            completion?(nil)
         }
     }
 }

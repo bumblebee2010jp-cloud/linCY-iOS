@@ -168,4 +168,78 @@ struct Server: @unchecked Sendable {
         try? FileManager.default.removeItem(at: destination)
         try FileManager.default.moveItem(at: temp, to: destination)
     }
+
+    // MARK: - 备份根目录（upload）操作，供文件夹镜像同步
+
+    struct UploadEntry: Decodable {
+        let name: String
+        let path: String
+        let isDir: Bool
+        /// 旧版服务端不返回 size；缺失时按 0 处理，只会导致多传一次。
+        let size: Int64?
+
+        enum CodingKeys: String, CodingKey {
+            case name, path, size
+            case isDir = "is_dir"
+        }
+    }
+
+    struct UploadContents: Decodable {
+        let path: String
+        let entries: [UploadEntry]
+    }
+
+    /// GET /api/upload-contents?path= — 列出备份根下某一层目录。
+    func uploadContents(path: String, cookie: String) async throws -> UploadContents {
+        var query: [URLQueryItem] = []
+        if !path.isEmpty { query.append(URLQueryItem(name: "path", value: path)) }
+        let (data, _) = try await send(request("api/upload-contents", query: query, cookie: cookie))
+        return try JSONDecoder().decode(UploadContents.self, from: data)
+    }
+
+    /// POST /api/upload-folder — 在备份根下新建文件夹，返回最终目录名。
+    @discardableResult
+    func createFolder(name: String, parent: String, cookie: String) async throws -> String {
+        var r = request("api/upload-folder", cookie: cookie)
+        r.httpMethod = "POST"
+        r.setValue("1", forHTTPHeaderField: "x-vuio-upload")
+        r.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        r.httpBody = try JSONSerialization.data(withJSONObject: ["name": name, "parent": parent])
+        let (data, _) = try await send(r)
+        struct Created: Decodable { let directory: String; let skipped: Bool? }
+        return try JSONDecoder().decode(Created.self, from: data).directory
+    }
+
+    /// POST /api/upload?path=&name=&conflict= — 把本地文件直传到备份根下的相对目录。
+    func uploadFile(path: String, name: String, fileURL: URL, size: Int64,
+                    overwrite: Bool, cookie: String) async throws {
+        var query = [URLQueryItem(name: "name", value: name)]
+        if !path.isEmpty { query.append(URLQueryItem(name: "path", value: path)) }
+        query.append(URLQueryItem(name: "conflict", value: overwrite ? "overwrite" : "skip"))
+        var r = request("api/upload", query: query, cookie: cookie)
+        r.httpMethod = "POST"
+        r.setValue("1", forHTTPHeaderField: "x-vuio-upload")
+        r.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+        r.setValue(String(size), forHTTPHeaderField: "Content-Length")
+        let (data, response) = try await session.upload(for: r, fromFile: fileURL)
+        let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard (200..<300).contains(code) else {
+            throw AppError.message("上传 \(name) HTTP \(code)：\(String(data: data.prefix(200), encoding: .utf8) ?? "")")
+        }
+    }
+
+    /// POST /api/upload-delete?path= — 删除备份根下的文件或文件夹。
+    /// 返回 false 表示服务端还没有这个接口（旧版本），调用方应跳过删除而不是报错。
+    func deleteUpload(path: String, cookie: String) async throws -> Bool {
+        var r = request("api/upload-delete", query: [URLQueryItem(name: "path", value: path)], cookie: cookie)
+        r.httpMethod = "POST"
+        r.setValue("1", forHTTPHeaderField: "x-vuio-delete")
+        let (data, response) = try await session.data(for: r)
+        let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+        if code == 404 { return false }
+        guard (200..<300).contains(code) else {
+            throw AppError.message("删除 \(path) HTTP \(code)：\(String(data: data.prefix(200), encoding: .utf8) ?? "")")
+        }
+        return true
+    }
 }
