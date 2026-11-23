@@ -75,8 +75,6 @@ struct ContentView: View {
         TabView {
             webTab
             albumTab
-            FolderBackupView()
-                .tabItem { Label("文件夹备份", systemImage: "folder") }
             connectionTab
         }
         .task { await restore() }
@@ -345,13 +343,16 @@ struct ContentView: View {
 
     private var connectionHelp: some View {
         Section {
-            Text("填写服务端“手机传输”的访问地址，默认端口 8091。手机需能访问电脑，服务端需保持开启。相册备份写入“相册备份文件夹”，文件夹备份写入“备份文件”根目录。")
+            Text("填写服务端“手机传输”的访问地址，默认端口 8091。手机需能访问电脑，服务端需保持开启。相册备份写入“相册备份文件夹”。")
             Text("相册内容只在你点击备份后上传。Live Photo 会分别备份原始照片与视频；仅 iCloud 中的原件会先下载。后台只尝试完成已提交的上传，其余内容下次手动继续。")
+            Text("原版功能里上传文件夹时，会自动转到 Safari 打开同一页面（App 内 WebView 不支持选文件夹）。")
             Button("打开系统权限设置") {
                 if let url = URL(string: UIApplication.openSettingsURLString) {
                     UIApplication.shared.open(url)
                 }
             }
+            Text("版本 \(AppInfo.version)")
+                .foregroundStyle(.secondary)
         }
         .font(.footnote)
     }
@@ -441,203 +442,5 @@ struct ContentView: View {
         } catch {
             connectionStatus = error.localizedDescription
         }
-    }
-}
-
-// MARK: - 文件夹备份
-
-struct FolderBackupView: View {
-    @StateObject private var manager = FolderBackupManager.shared
-    @AppStorage("serverAddress") private var address = ""
-    @AppStorage("wifiOnly") private var wifiOnly = true
-    @State private var showImporter = false
-    @State private var debugTap = "尚未点击"
-
-    var body: some View {
-        NavigationStack {
-            List {
-                statusSection
-                folderListSection
-                logsSection
-                diagnosticsSection
-            }
-            .navigationTitle("文件夹备份")
-            .fileImporter(
-                isPresented: $showImporter,
-                allowedContentTypes: [.folder],
-                allowsMultipleSelection: false
-            ) { result in
-                switch result {
-                case .success(let urls):
-                    guard let url = urls.first else {
-                        manager.status = "没有取到文件夹"
-                        return
-                    }
-                    debugTap = "已选中 \(url.lastPathComponent)"
-                    _ = manager.addFolder(url)
-                case .failure(let error):
-                    manager.status = "选择失败：\(error.localizedDescription)"
-                }
-            }
-        }
-    }
-
-    @ViewBuilder
-    private var diagnosticsSection: some View {
-        Section("诊断") {
-            Text("版本 \(AppInfo.version)")
-                .font(.footnote)
-            Text("按钮 \(debugTap)")
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-            Text("running = \(manager.running ? "true" : "false") · 已添加 \(manager.folders.count) 个")
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-        }
-    }
-
-    @ViewBuilder
-    private var statusSection: some View {
-        Section {
-            Text(manager.status)
-            if manager.running {
-                ProgressView(value: manager.progress)
-            }
-            Text("上传 \(manager.uploaded) · 跳过 \(manager.skipped) · 失败 \(manager.failed)")
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-            if manager.running {
-                HStack(spacing: 8) {
-                    ProgressView()
-                    Text("正在同步，请保持此页在前台")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                }
-            } else {
-                Button {
-                    Task { await start() }
-                } label: {
-                    Label("开始同步", systemImage: "arrow.triangle.2.circlepath")
-                }
-                .disabled(address.isEmpty || manager.folders.isEmpty)
-            }
-        } footer: {
-            Text("以手机文件夹为准，把内容（含所有子文件夹）上传到服务器「备份文件」根目录下的同名文件夹，服务器没有就新建。大小没变化的文件会跳过。")
-        }
-    }
-
-    @ViewBuilder
-    private var folderListSection: some View {
-        Section {
-            Button {
-                debugTap = "主按钮 " + Date().formatted(date: .omitted, time: .standard)
-                showImporter = true
-            } label: {
-                Label("添加手机文件夹", systemImage: "folder.badge.plus")
-            }
-
-            Button {
-                debugTap = "备用按钮 " + Date().formatted(date: .omitted, time: .standard)
-                if let error = FolderPickerService.shared.present(completion: { url in
-                    guard let url else { return }
-                    debugTap = "已选中 \(url.lastPathComponent)"
-                    _ = manager.addFolder(url)
-                }) {
-                    manager.status = "备用路径失败：\(error)"
-                }
-            } label: {
-                Label("备用：直接弹出选择器", systemImage: "folder")
-            }
-            .foregroundStyle(.secondary)
-
-            ForEach(manager.folders) { folder in
-                HStack(spacing: 10) {
-                    Image(systemName: "folder.fill").foregroundStyle(.tint)
-                    Text(folder.displayName)
-                    Spacer()
-                }
-                .contextMenu {
-                    Button(role: .destructive) {
-                        manager.remove(folder.id)
-                    } label: {
-                        Label("移除", systemImage: "trash")
-                    }
-                }
-            }
-        } header: {
-            Text("手机文件夹（\(manager.folders.count)）")
-        } footer: {
-            Text("可添加多个文件夹，长按可移除。移除只取消同步，不会删除手机或服务器上的文件。")
-        }
-    }
-
-    @ViewBuilder
-    private var logsSection: some View {
-        if !manager.logs.isEmpty {
-            Section("本次记录") {
-                ForEach(Array(manager.logs.enumerated()), id: \.offset) { _, text in
-                    Text(text).font(.caption).textSelection(.enabled)
-                }
-            }
-        }
-    }
-
-    @MainActor
-    private func start() async {
-        await manager.startSync(address: address,
-            password: Credentials.password(for: address), wifiOnly: wifiOnly)
-    }
-}
-
-// MARK: - 系统文件夹选择器
-
-/// 直接 present 系统文件夹选择器（供 WKWebView 之外的场景备用）。
-/// 包成 UIViewRepresentable 塞进 SwiftUI 的 .sheet 里经常弹不出来，这里走 UIKit。
-final class FolderPickerService: NSObject, UIDocumentPickerDelegate {
-    static let shared = FolderPickerService()
-
-    private var completion: ((URL?) -> Void)?
-
-    @discardableResult
-    func present(completion: @escaping (URL?) -> Void) -> String? {
-        guard let host = Self.topViewController(), host.view.window != nil else {
-            return "找不到可用的界面"
-        }
-        self.completion = completion
-
-        // 文件夹不能用 asCopy，否则抛异常。
-        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.folder], asCopy: false)
-        picker.allowsMultipleSelection = false
-        picker.delegate = self
-        if host.presentedViewController != nil {
-            host.dismiss(animated: false) { host.present(picker, animated: true) }
-        } else {
-            host.present(picker, animated: true)
-        }
-        return nil
-    }
-
-    private static func topViewController() -> UIViewController? {
-        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
-        let windows = scenes.flatMap { $0.windows }
-        let window = windows.first { $0.isKeyWindow } ?? windows.first
-        var controller = window?.rootViewController
-        while let presented = controller?.presentedViewController {
-            controller = presented
-        }
-        return controller
-    }
-
-    func documentPicker(_ controller: UIDocumentPickerViewController,
-                        didPickDocumentsAt urls: [URL]) {
-        let block = completion
-        completion = nil
-        block?(urls.first)
-    }
-
-    func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
-        let block = completion
-        completion = nil
-        block?(nil)
     }
 }
