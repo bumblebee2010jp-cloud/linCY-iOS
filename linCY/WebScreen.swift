@@ -148,8 +148,13 @@ struct WebContent: UIViewRepresentable {
                 allowsDirectories = (parameters.value(forKey: "allowsDirectories") as? Bool) ?? false
             }
 
-            let types: [UTType] = allowsDirectories ? [.folder] : [.data]
-            let picker = UIDocumentPickerViewController(forOpeningContentTypes: types, asCopy: true)
+            // 文件夹选择不支持 asCopy（会抛异常直接闪退），只能引用原位置。
+            let picker: UIDocumentPickerViewController
+            if allowsDirectories {
+                picker = UIDocumentPickerViewController(forOpeningContentTypes: [.folder], asCopy: false)
+            } else {
+                picker = UIDocumentPickerViewController(forOpeningContentTypes: [.data], asCopy: true)
+            }
             picker.allowsMultipleSelection = false
             picker.delegate = self
 

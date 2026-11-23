@@ -441,7 +441,6 @@ struct FolderBackupView: View {
     @StateObject private var manager = FolderBackupManager.shared
     @AppStorage("serverAddress") private var address = ""
     @AppStorage("wifiOnly") private var wifiOnly = true
-    @State private var showPicker = false
 
     var body: some View {
         NavigationStack {
@@ -451,11 +450,6 @@ struct FolderBackupView: View {
                 logsSection
             }
             .navigationTitle("文件夹备份")
-            .sheet(isPresented: $showPicker) {
-                FolderPicker { url in
-                    _ = manager.addFolder(url)
-                }
-            }
         }
     }
 
@@ -493,7 +487,10 @@ struct FolderBackupView: View {
     private var folderListSection: some View {
         Section {
             Button {
-                showPicker = true
+                FolderPickerService.shared.present { url in
+                    guard let url else { return }
+                    _ = manager.addFolder(url)
+                }
             } label: {
                 Label("添加手机文件夹", systemImage: "folder.badge.plus")
             }
@@ -539,34 +536,47 @@ struct FolderBackupView: View {
 
 // MARK: - 系统文件夹选择器
 
-/// iOS 只能选文件夹，返回 security-scoped URL，由 FolderBackupManager 转成 bookmark 长期访问。
-struct FolderPicker: UIViewControllerRepresentable {
-    let onPick: (URL) -> Void
-    @Environment(\.dismiss) private var dismiss
+/// 直接 present 系统文件夹选择器。
+/// 包成 UIViewRepresentable 塞进 SwiftUI 的 .sheet 里经常弹不出来，这里走 UIKit。
+final class FolderPickerService: NSObject, UIDocumentPickerDelegate {
+    static let shared = FolderPickerService()
 
-    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+    private var completion: ((URL?) -> Void)?
+
+    func present(completion: @escaping (URL?) -> Void) {
+        guard let host = Self.topViewController() else {
+            completion(nil)
+            return
+        }
+        self.completion = completion
+
+        // 文件夹不能用 asCopy，否则抛异常。
         let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.folder], asCopy: false)
         picker.allowsMultipleSelection = false
-        picker.delegate = context.coordinator
-        return picker
+        picker.delegate = self
+        host.present(picker, animated: true)
     }
 
-    func updateUIViewController(_ controller: UIDocumentPickerViewController, context: Context) {}
-
-    func makeCoordinator() -> Coordinator { Coordinator(self) }
-
-    final class Coordinator: NSObject, UIDocumentPickerDelegate {
-        private let parent: FolderPicker
-        init(_ parent: FolderPicker) { self.parent = parent }
-
-        func documentPicker(_ controller: UIDocumentPickerViewController,
-                            didPickDocumentsAt urls: [URL]) {
-            if let url = urls.first { parent.onPick(url) }
-            parent.dismiss()
+    private static func topViewController() -> UIViewController? {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let window = scenes.flatMap { $0.windows }.first { $0.isKeyWindow }
+        var controller = window?.rootViewController
+        while let presented = controller?.presentedViewController {
+            controller = presented
         }
+        return controller
+    }
 
-        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
-            parent.dismiss()
-        }
+    func documentPicker(_ controller: UIDocumentPickerViewController,
+                        didPickDocumentsAt urls: [URL]) {
+        let block = completion
+        completion = nil
+        block?(urls.first)
+    }
+
+    func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+        let block = completion
+        completion = nil
+        block?(nil)
     }
 }
