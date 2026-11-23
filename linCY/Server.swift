@@ -52,10 +52,23 @@ struct Server: @unchecked Sendable {
 
     func request(_ path: String, query: [URLQueryItem] = [], cookie: String? = nil) -> URLRequest {
         var c = URLComponents(url: base.appendingPathComponent(path), resolvingAgainstBaseURL: false)!
-        if !query.isEmpty { c.queryItems = query }
+        if !query.isEmpty { c.percentEncodedQuery = Self.encodeQuery(query) }
         var request = URLRequest(url: c.url!)
         if let cookie { request.setValue(cookie, forHTTPHeaderField: "Cookie") }
         return request
+    }
+
+    /// URLComponents 不会编码 `+`，而服务端按表单规则解析 query 时会把 `+` 当成空格，
+    /// 导致「a+b.jpg」上传后变成「a b.jpg」，之后每次同步都判定为缺失并重传。
+    /// 这里对 query 统一手工编码，把 `+` 等子分隔符显式转义。
+    private static func encodeQuery(_ query: [URLQueryItem]) -> String {
+        var allowed = CharacterSet.urlQueryAllowed
+        allowed.remove(charactersIn: "+&=?#%")
+        return query.map { item in
+            let name = item.name.addingPercentEncoding(withAllowedCharacters: allowed) ?? item.name
+            let value = (item.value ?? "").addingPercentEncoding(withAllowedCharacters: allowed) ?? ""
+            return name + "=" + value
+        }.joined(separator: "&")
     }
 
     func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
