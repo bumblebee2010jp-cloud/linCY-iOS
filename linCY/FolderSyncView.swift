@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct FolderSyncView: View {
     let currentAddress: String
@@ -159,16 +160,19 @@ private struct SyncTaskEditor: View {
                 Button("保存任务") { save() }.disabled(authorizing || picking)
             }.navigationTitle(original == nil ? "新建同步任务" : "编辑同步任务")
                 .toolbar { Button("取消") { dismiss() } }
-                .fullScreenCover(isPresented: $picking, onDismiss: authorizePickedFolder) {
-                    NativeFolderPicker(onPick: { selection in
-                        pendingFolder = selection
+                .fileImporter(isPresented: $picking, allowedContentTypes: [.folder], allowsMultipleSelection: false) { result in
+                    switch result {
+                    case .success(let urls):
+                        guard let url = urls.first else { selectionStatus = "未选择文件夹"; return }
+                        // Retain the security scope from the moment the system hands the URL over.
+                        pendingFolder = PickedFolder(url)
                         selectionStatus = "已收到系统选择结果"
-                        picking = false
-                    }, onCancel: {
+                        authorizePickedFolder()
+                    case .failure(let failure):
                         pendingFolder = nil
-                        selectionStatus = "已取消选择"
-                        picking = false
-                    }).ignoresSafeArea()
+                        let nsError = failure as NSError
+                        selectionStatus = "选择文件夹失败：\(nsError.localizedDescription)（\(nsError.domain) / \(nsError.code)）"
+                    }
                 }
                 .alert("文件夹授权失败", isPresented: $showSelectionError) {
                     Button("好", role: .cancel) {}

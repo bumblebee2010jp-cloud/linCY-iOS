@@ -101,9 +101,11 @@ struct NativeFolderPicker: UIViewControllerRepresentable {
             completed = true
             finish(controller) { self.parent.onCancel() }
         }
+        // UIDocumentPickerViewController dismisses itself after calling the delegate.
+        // Calling dismiss(animated:completion:) here as well races that dismissal, and the
+        // completion block can then never run, so the selection was silently lost.
         private func finish(_ picker: UIDocumentPickerViewController, then callback: @escaping () -> Void) {
-            if picker.presentingViewController != nil { picker.dismiss(animated: true, completion: callback) }
-            else { callback() }
+            callback()
         }
     }
 }
