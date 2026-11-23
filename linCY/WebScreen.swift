@@ -148,23 +148,52 @@ struct WebContent: UIViewRepresentable {
                 allowsDirectories = (parameters.value(forKey: "allowsDirectories") as? Bool) ?? false
             }
 
-            // 文件夹选择不支持 asCopy（会抛异常直接闪退），只能引用原位置。
-            let picker: UIDocumentPickerViewController
+            // 选文件夹（webkitdirectory）要求把整个目录的内容交给网页，
+            // iOS 的 WKWebView 只接受文件 URL、不会递归展开目录，做不到。
+            // 交给系统 Safari（那边原生支持），并提示用户。
             if allowsDirectories {
-                picker = UIDocumentPickerViewController(forOpeningContentTypes: [.folder], asCopy: false)
-            } else {
-                picker = UIDocumentPickerViewController(forOpeningContentTypes: [.data], asCopy: true)
+                filePickerCompletion = nil
+                parent.onError("网页正在选择文件夹，App 内不支持，已转到 Safari 打开同一页面。")
+                if let target = webView.url {
+                    UIApplication.shared.open(target)
+                }
+                completionHandler(nil)
+                return
             }
+
+            let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.data], asCopy: true)
             picker.allowsMultipleSelection = false
             picker.delegate = self
 
             filePickerCompletion = completionHandler
-            guard let host = presenter(webView) else {
+
+            guard let host = presenter(webView) ?? Self.topViewController(),
+                  host.view.window != nil else {
                 filePickerCompletion = nil
+                parent.onError("无法打开文件选择器：找不到可用的界面")
                 completionHandler(nil)
                 return
             }
-            host.present(picker, animated: true)
+
+            // 有正在展示的控制器时先收起，否则 present 会被丢弃且没有任何提示。
+            if host.presentedViewController != nil {
+                host.dismiss(animated: false) {
+                    host.present(picker, animated: true)
+                }
+            } else {
+                host.present(picker, animated: true)
+            }
+        }
+
+        private static func topViewController() -> UIViewController? {
+            let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+            let windows = scenes.flatMap { $0.windows }
+            let window = windows.first { $0.isKeyWindow } ?? windows.first
+            var controller = window?.rootViewController
+            while let presented = controller?.presentedViewController {
+                controller = presented
+            }
+            return controller
         }
 
         func documentPicker(_ controller: UIDocumentPickerViewController,

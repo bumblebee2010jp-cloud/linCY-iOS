@@ -441,6 +441,7 @@ struct FolderBackupView: View {
     @StateObject private var manager = FolderBackupManager.shared
     @AppStorage("serverAddress") private var address = ""
     @AppStorage("wifiOnly") private var wifiOnly = true
+    @State private var showImporter = false
 
     var body: some View {
         NavigationStack {
@@ -450,6 +451,22 @@ struct FolderBackupView: View {
                 logsSection
             }
             .navigationTitle("文件夹备份")
+            .fileImporter(
+                isPresented: $showImporter,
+                allowedContentTypes: [.folder],
+                allowsMultipleSelection: false
+            ) { result in
+                switch result {
+                case .success(let urls):
+                    guard let url = urls.first else {
+                        manager.status = "没有取到文件夹"
+                        return
+                    }
+                    _ = manager.addFolder(url)
+                case .failure(let error):
+                    manager.status = "选择失败：\(error.localizedDescription)"
+                }
+            }
         }
     }
 
@@ -487,10 +504,8 @@ struct FolderBackupView: View {
     private var folderListSection: some View {
         Section {
             Button {
-                FolderPickerService.shared.present { url in
-                    guard let url else { return }
-                    _ = manager.addFolder(url)
-                }
+                manager.status = "正在打开「文件」App…"
+                showImporter = true
             } label: {
                 Label("添加手机文件夹", systemImage: "folder.badge.plus")
             }
@@ -536,17 +551,17 @@ struct FolderBackupView: View {
 
 // MARK: - 系统文件夹选择器
 
-/// 直接 present 系统文件夹选择器。
+/// 直接 present 系统文件夹选择器（供 WKWebView 之外的场景备用）。
 /// 包成 UIViewRepresentable 塞进 SwiftUI 的 .sheet 里经常弹不出来，这里走 UIKit。
 final class FolderPickerService: NSObject, UIDocumentPickerDelegate {
     static let shared = FolderPickerService()
 
     private var completion: ((URL?) -> Void)?
 
-    func present(completion: @escaping (URL?) -> Void) {
-        guard let host = Self.topViewController() else {
-            completion(nil)
-            return
+    @discardableResult
+    func present(completion: @escaping (URL?) -> Void) -> String? {
+        guard let host = Self.topViewController(), host.view.window != nil else {
+            return "找不到可用的界面"
         }
         self.completion = completion
 
@@ -554,12 +569,18 @@ final class FolderPickerService: NSObject, UIDocumentPickerDelegate {
         let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.folder], asCopy: false)
         picker.allowsMultipleSelection = false
         picker.delegate = self
-        host.present(picker, animated: true)
+        if host.presentedViewController != nil {
+            host.dismiss(animated: false) { host.present(picker, animated: true) }
+        } else {
+            host.present(picker, animated: true)
+        }
+        return nil
     }
 
     private static func topViewController() -> UIViewController? {
         let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
-        let window = scenes.flatMap { $0.windows }.first { $0.isKeyWindow }
+        let windows = scenes.flatMap { $0.windows }
+        let window = windows.first { $0.isKeyWindow } ?? windows.first
         var controller = window?.rootViewController
         while let presented = controller?.presentedViewController {
             controller = presented
