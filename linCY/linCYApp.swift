@@ -1,6 +1,31 @@
 import SwiftUI
 import UIKit
 
+enum AlbumSource: String, CaseIterable, Identifiable {
+    case local = "本机相册"
+    case remote = "服务器相册"
+    var id: String { rawValue }
+}
+
+enum SyncRequest: Identifiable {
+    case all
+    case album(String)
+
+    var id: String {
+        switch self {
+        case .all: return "__all__"
+        case .album(let name): return name
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .all: return "同步全部服务器相册？"
+        case .album(let name): return "同步「\(name)」到手机相册？"
+        }
+    }
+}
+
 final class AppDelegate: NSObject, UIApplicationDelegate {
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions:
         [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
@@ -27,7 +52,8 @@ struct ContentView: View {
     @State private var draft = ""
     @State private var password = ""
     @State private var showHiddenAlbums = false
-    @State private var confirmSync = false
+    @State private var albumSource: AlbumSource = .local
+    @State private var syncRequest: SyncRequest?
     @State private var connectionStatus = ""
     @State private var connecting = false
     @State private var webToken = UUID()
@@ -62,15 +88,20 @@ struct ContentView: View {
                                     password: Credentials.password(for: address), wifiOnly: wifiOnly) }
                             } label: { Label("开始备份", systemImage: "icloud.and.arrow.up") }
                                 .disabled(address.isEmpty || backup.selected.isEmpty || backup.restoring)
-
-                            Button {
-                                confirmSync = true
-                            } label: { Label("从服务器同步到相册", systemImage: "arrow.down.circle") }
-                                .disabled(address.isEmpty || backup.restoring)
                         }
                     } footer: {
-                        Text("每次手动点击才开始。备份是手机 → 服务器：自动对比同名文件夹，缺少则新建；按文件名跳过已有文件，不覆盖、不删除。同步是服务器 → 手机：同名相册不存在就新建，只下载手机里没有的文件。首次备份建议保持此页在前台。")
+                        Text("备份是手机 → 服务器：对比同名文件夹，缺少则新建，按文件名跳过已有文件，不覆盖、不删除。同步是服务器 → 手机：在下方切到「服务器相册」，点相册或「同步全部」下载缺失文件。首次备份建议保持此页在前台。")
                     }
+                    Section {
+                        Picker("相册来源", selection: $albumSource) {
+                            ForEach(AlbumSource.allCases) { source in
+                                Text(source.rawValue).tag(source)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                    }
+
+                    if albumSource == .local {
                     Section {
                         Button("读取 / 刷新手机相册") { Task { await backup.loadAlbums() } }
                             .disabled(backup.running)
@@ -98,9 +129,59 @@ struct ContentView: View {
                             }
                         }
                     } header: {
-                        Text("选择要备份的相册（自动记住）")
+                        Text("本机相册（\(visibleAlbums.count)）")
                     } footer: {
                         Text("长按相册可隐藏，隐藏的相册会移到底部「已隐藏相册」并取消勾选；需要时展开即可恢复。")
+                    }
+                    } else {
+                    Section {
+                        if backup.loadingRemote {
+                            HStack(spacing: 8) {
+                                ProgressView()
+                                Text("正在读取服务器相册…").foregroundStyle(.secondary)
+                            }
+                        } else if backup.remoteAlbums.isEmpty {
+                            Text("还没有读取。点右上角「读取 / 刷新」。")
+                                .font(.footnote).foregroundStyle(.secondary)
+                        } else {
+                            ForEach(backup.remoteAlbums, id: \.self) { name in
+                                Button {
+                                    syncRequest = .album(name)
+                                } label: {
+                                    HStack {
+                                        Image(systemName: "folder")
+                                        Text(name).foregroundStyle(.primary).lineLimit(1)
+                                        Spacer()
+                                        Image(systemName: "arrow.down.circle")
+                                            .foregroundStyle(.tint)
+                                    }
+                                }
+                                .disabled(backup.running || backup.restoring)
+                            }
+                            Button {
+                                syncRequest = .all
+                            } label: {
+                                Label("同步全部（\(backup.remoteAlbums.count) 个相册）",
+                                      systemImage: "arrow.down.circle.fill")
+                            }
+                            .disabled(backup.running || backup.restoring)
+                        }
+                    } header: {
+                        HStack {
+                            Text("服务器相册（\(backup.remoteAlbums.count)）")
+                            Spacer()
+                            Button {
+                                Task { await backup.loadRemoteAlbums(address: address,
+                                    password: Credentials.password(for: address), wifiOnly: wifiOnly) }
+                            } label: {
+                                Text(backup.loadingRemote ? "读取中…" : "读取 / 刷新")
+                                    .font(.footnote)
+                            }
+                            .disabled(backup.running || backup.loadingRemote)
+                        }
+                    } footer: {
+                        Text("点某个相册即可把它同步到手机同名相册：手机上没有该相册会新建，只下载缺失文件。与已隐藏手机相册同名的会跳过。")
+                    }
                     }
                     if !backup.logs.isEmpty {
                         Section("本次记录") {
@@ -110,15 +191,29 @@ struct ContentView: View {
                         }
                     }
                 }.navigationTitle("相册备份")
-                    .confirmationDialog("从服务器同步到手机相册？", isPresented: $confirmSync,
-                                        titleVisibility: .visible) {
+                    .onChange(of: albumSource) { source in
+                        guard source == .remote, backup.remoteAlbums.isEmpty,
+                              !address.isEmpty, !backup.loadingRemote, !backup.running else { return }
+                        Task { await backup.loadRemoteAlbums(address: address,
+                            password: Credentials.password(for: address), wifiOnly: wifiOnly) }
+                    }
+                    .confirmationDialog(syncRequest?.title ?? "", isPresented: Binding(
+                        get: { syncRequest != nil },
+                        set: { if !$0 { syncRequest = nil } }
+                    ), titleVisibility: .visible) {
                         Button("开始同步") {
-                            Task { await backup.syncFromServer(address: address,
+                            guard let request = syncRequest else { return }
+                            let targets: [String]
+                            switch request {
+                            case .all: targets = backup.remoteAlbums
+                            case .album(let name): targets = [name]
+                            }
+                            Task { await backup.syncAlbums(targets, address: address,
                                 password: Credentials.password(for: address), wifiOnly: wifiOnly) }
                         }
                         Button("取消", role: .cancel) {}
                     } message: {
-                        Text("会遍历服务器上所有相册文件夹：手机上缺的同名相册会新建，只下载手机里没有的文件。已隐藏的相册会跳过。")
+                        Text("对比服务器与手机相册，只下载手机里没有的文件；手机上缺的同名相册会自动新建。")
                     }
             }.tabItem { Label("相册备份", systemImage: "photo.on.rectangle.angled") }
             NavigationStack {

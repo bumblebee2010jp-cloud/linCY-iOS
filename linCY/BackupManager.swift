@@ -7,6 +7,9 @@ final class BackupManager: NSObject, ObservableObject, URLSessionDataDelegate {
     static let shared = BackupManager()
     static let sessionID = "com.lincy.ios.album-upload"
     @Published var albums: [PhoneAlbum] = []
+    /// 服务器上的相册文件夹列表（相册备份页「服务器相册」分页展示）。
+    @Published var remoteAlbums: [String] = []
+    @Published var loadingRemote = false
     @Published var selected = Set(UserDefaults.standard.stringArray(forKey: "selectedAlbums") ?? []) {
         didSet { UserDefaults.standard.set(Array(selected), forKey: "selectedAlbums") }
     }
@@ -191,10 +194,26 @@ final class BackupManager: NSObject, ObservableObject, URLSessionDataDelegate {
 
     // MARK: - 反向同步：服务器相册 → 手机相册
 
-    /// 把服务器上的每个相册文件夹同步到手机同名相册：不存在就新建，
+    /// 读取服务器上的相册文件夹列表，供「服务器相册」分页展示。
+    @MainActor func loadRemoteAlbums(address: String, password: String, wifiOnly: Bool) async {
+        guard !running, !loadingRemote else { return }
+        loadingRemote = true
+        defer { loadingRemote = false }
+        do {
+            let server = try Server(address: address, wifiOnly: wifiOnly)
+            let cookie = try await server.login(password: password)
+            remoteAlbums = try await server.albums(cookie: cookie)
+            status = "服务器上有 \(remoteAlbums.count) 个相册"
+        } catch {
+            status = "读取服务器相册失败：\(error.localizedDescription)"
+            log(status)
+        }
+    }
+
+    /// 把服务器上的指定相册同步到手机同名相册：不存在就新建，
     /// 只下载手机里没有的文件（按原始文件名比对，和上传用的是同一套命名）。
-    @MainActor func syncFromServer(address: String, password: String, wifiOnly: Bool) async {
-        guard !running, !restoring else { return }
+    @MainActor func syncAlbums(_ names: [String], address: String, password: String, wifiOnly: Bool) async {
+        guard !running, !restoring, !names.isEmpty else { return }
         running = true
         stopRequested = false
         uploaded = 0; skipped = 0; failed = 0; downloaded = 0; progress = 0
@@ -209,8 +228,7 @@ final class BackupManager: NSObject, ObservableObject, URLSessionDataDelegate {
         do {
             let server = try Server(address: address, wifiOnly: wifiOnly)
             let cookie = try await server.login(password: password)
-            let remoteAlbums = try await server.albums(cookie: cookie)
-            log("服务器上有 \(remoteAlbums.count) 个相册")
+            log("开始同步 \(names.count) 个相册")
 
             // 手机上被隐藏的相册，同名的不再往回同步。
             var hiddenNames = Set<String>()
@@ -220,7 +238,7 @@ final class BackupManager: NSObject, ObservableObject, URLSessionDataDelegate {
             }
 
             var index = 0
-            for remoteName in remoteAlbums {
+            for remoteName in names {
                 try checkStop()
                 index += 1
                 let title = remoteName.split(separator: "/").last.map(String.init) ?? remoteName
@@ -229,7 +247,7 @@ final class BackupManager: NSObject, ObservableObject, URLSessionDataDelegate {
                     continue
                 }
 
-                status = "对比服务器相册 \(index)/\(remoteAlbums.count)：\(remoteName)"
+                status = "对比 \(index)/\(names.count)：\(remoteName)"
                 let items = try await remotePhotos(server: server, album: remoteName, cookie: cookie)
                 if items.isEmpty {
                     log("\(remoteName)：服务器上没有可同步的图片或视频")
