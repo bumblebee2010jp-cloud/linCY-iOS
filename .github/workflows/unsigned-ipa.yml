@@ -99,7 +99,7 @@ jobs:
           else:
               body = "EXIT " + exit_text + "\nNO MATCHED ERROR LINES\n\n" + "\n".join(lines[-30:])
           payload = json.dumps({
-              "topic": "lincy",
+              "topic": "lincy-4abb363c93d7",
               "title": "linCY 构建失败 " + exit_text,
               "message": body[:3400],
               "tags": ["warning", "xcode"],
