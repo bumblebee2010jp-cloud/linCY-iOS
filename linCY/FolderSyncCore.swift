@@ -61,74 +61,98 @@ struct ScopedFolder {
     func close() { if started { url.stopAccessingSecurityScopedResource() } }
 }
 
-// Retain the security scope from the delegate callback until background authorization
-// finishes. No metadata lookup, symlink resolution or bookmark I/O runs in the callback.
-final class PickedFolder: @unchecked Sendable {
-    let url: URL
-    private let started: Bool
-    init(_ url: URL) {
-        self.url = url
-        started = url.startAccessingSecurityScopedResource()
-    }
-    deinit { if started { url.stopAccessingSecurityScopedResource() } }
-}
+// MARK: - App 文档目录浏览（不依赖系统文件夹选择器）
 
-struct NativeFolderPicker: UIViewControllerRepresentable {
-    var onPick: (PickedFolder) -> Void
-    var onCancel: () -> Void
-    func makeCoordinator() -> Coordinator { Coordinator(self) }
-    func makeUIViewController(context: Context) -> FolderPickerHostController {
-        let host = FolderPickerHostController()
-        host.coordinator = context.coordinator
-        return host
+/// App 自己的 Documents 目录。配合 Info.plist 的 UIFileSharingEnabled，
+/// 用户可以在「文件」App → 我的 iPhone → linCY 里放入文件夹，
+/// 这里直接逐层浏览并选择，完全不经过 UIDocumentPicker。
+enum DocumentFolders {
+    static var root: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
     }
-    func updateUIViewController(_ controller: FolderPickerHostController, context: Context) {
-        context.coordinator.parent = self
+
+    static func children(of folder: URL) -> [URL] {
+        let keys: [URLResourceKey] = [.isDirectoryKey]
+        let items = (try? FileManager.default.contentsOfDirectory(
+            at: folder, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles])) ?? []
+        return items
+            .filter { (try? $0.resourceValues(forKeys: Set(keys)).isDirectory) == true }
+            .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
     }
-    final class Coordinator: NSObject, UIDocumentPickerDelegate {
-        var parent: NativeFolderPicker
-        private var completed = false
-        init(_ parent: NativeFolderPicker) { self.parent = parent }
-        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
-            guard !completed else { return }
-            completed = true
-            guard let url = urls.first else { finish(controller) { self.parent.onCancel() }; return }
-            let selection = PickedFolder(url)
-            finish(controller) { self.parent.onPick(selection) }
-        }
-        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
-            guard !completed else { return }
-            completed = true
-            finish(controller) { self.parent.onCancel() }
-        }
-        // UIDocumentPickerViewController dismisses itself after calling the delegate.
-        // Calling dismiss(animated:completion:) here as well races that dismissal, and the
-        // completion block can then never run, so the selection was silently lost.
-        private func finish(_ picker: UIDocumentPickerViewController, then callback: @escaping () -> Void) {
-            callback()
-        }
+
+    static func displayPath(of folder: URL) -> String {
+        let base = root.standardizedFileURL.path
+        let value = folder.standardizedFileURL.path
+        guard value.hasPrefix(base) else { return folder.lastPathComponent }
+        var relative = String(value.dropFirst(base.count))
+        while relative.hasPrefix("/") { relative.removeFirst() }
+        return relative.isEmpty ? "linCY" : relative
     }
 }
 
-// UIKit owns the document browser presentation; SwiftUI owns only this full-screen
-// host. This avoids stacking a document browser sheet directly inside the task sheet.
-final class FolderPickerHostController: UIViewController {
-    var coordinator: NativeFolderPicker.Coordinator!
-    private var presentedPicker = false
-    override func viewDidLoad() {
-        super.viewDidLoad()
-        view.backgroundColor = .systemBackground
+/// 在 App 文档目录里逐层浏览并选择文件夹。
+/// 每个列表行只有一个可点控件，避免 List 同行多 Button 互相抢占。
+struct AppFolderPicker: View {
+    var folder: URL = DocumentFolders.root
+    var onPick: (URL) -> Void
+    var onClose: () -> Void
+
+    @State private var children: [URL] = []
+
+    private var isRoot: Bool {
+        folder.standardizedFileURL.path == DocumentFolders.root.standardizedFileURL.path
     }
-    override func viewDidAppear(_ animated: Bool) {
-        super.viewDidAppear(animated)
-        guard !presentedPicker else { return }
-        presentedPicker = true
-        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [UTType.folder], asCopy: false)
-        picker.allowsMultipleSelection = false
-        picker.shouldShowFileExtensions = true
-        picker.delegate = coordinator
-        picker.modalPresentationStyle = .fullScreen
-        present(picker, animated: true)
+
+    var body: some View {
+        List {
+            if !isRoot {
+                Section {
+                    Button {
+                        onPick(folder)
+                    } label: {
+                        Label("选择此文件夹：\(DocumentFolders.displayPath(of: folder))",
+                              systemImage: "checkmark.circle")
+                    }
+                }
+            }
+
+            Section {
+                if children.isEmpty {
+                    Text("这里没有文件夹。打开「文件」App → 我的 iPhone → linCY，把文件夹拷进来；也可以点右上角新建一个。")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                ForEach(children, id: \.self) { child in
+                    NavigationLink(child.lastPathComponent) {
+                        AppFolderPicker(folder: child, onPick: onPick, onClose: onClose)
+                    }
+                }
+            } header: {
+                Text(DocumentFolders.displayPath(of: folder))
+            }
+        }
+        .navigationTitle(isRoot ? "App 文档" : folder.lastPathComponent)
+        .toolbar {
+            ToolbarItem(placement: .cancellationAction) {
+                Button("关闭") { onClose() }
+            }
+            ToolbarItem(placement: .primaryAction) {
+                Button("新建文件夹") { createFolder() }
+            }
+        }
+        .onAppear(perform: reload)
+    }
+
+    private func reload() {
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        children = DocumentFolders.children(of: folder)
+    }
+
+    private func createFolder() {
+        let name = "新建文件夹 " + String(Int(Date().timeIntervalSince1970) % 10000)
+        let target = folder.appendingPathComponent(name, isDirectory: true)
+        try? FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+        reload()
     }
 }
 
