@@ -123,6 +123,14 @@ jobs:
           fi
           echo "产物: $APP"
 
+          # 用 tag 覆盖版本号，方便在手机上区分每一版安装包
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            TAG_VERSION="${GITHUB_REF_NAME#v}"
+            /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $TAG_VERSION" "$APP/Info.plist" 2>/dev/null || true
+            /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${GITHUB_RUN_NUMBER}" "$APP/Info.plist" 2>/dev/null || true
+            echo "版本号已覆盖为 $TAG_VERSION (${GITHUB_RUN_NUMBER})"
+          fi
+
           rm -rf "$APP/_CodeSignature"
           rm -f  "$APP/embedded.mobileprovision"
 

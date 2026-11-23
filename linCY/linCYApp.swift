@@ -8,6 +8,15 @@ enum AlbumSource: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+enum AppInfo {
+    /// CI 会用 tag 覆盖 Info.plist 的版本号，便于区分每一版安装包。
+    static var version: String {
+        let short = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
+        return "\(short) (\(build))"
+    }
+}
+
 enum SyncRequest: Identifiable {
     case albums([String])
 
@@ -442,6 +451,7 @@ struct FolderBackupView: View {
     @AppStorage("serverAddress") private var address = ""
     @AppStorage("wifiOnly") private var wifiOnly = true
     @State private var showImporter = false
+    @State private var debugTap = "尚未点击"
 
     var body: some View {
         NavigationStack {
@@ -449,6 +459,7 @@ struct FolderBackupView: View {
                 statusSection
                 folderListSection
                 logsSection
+                diagnosticsSection
             }
             .navigationTitle("文件夹备份")
             .fileImporter(
@@ -462,11 +473,26 @@ struct FolderBackupView: View {
                         manager.status = "没有取到文件夹"
                         return
                     }
+                    debugTap = "已选中 \(url.lastPathComponent)"
                     _ = manager.addFolder(url)
                 case .failure(let error):
                     manager.status = "选择失败：\(error.localizedDescription)"
                 }
             }
+        }
+    }
+
+    @ViewBuilder
+    private var diagnosticsSection: some View {
+        Section("诊断") {
+            Text("版本 \(AppInfo.version)")
+                .font(.footnote)
+            Text("按钮 \(debugTap)")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            Text("running = \(manager.running ? "true" : "false") · 已添加 \(manager.folders.count) 个")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
         }
     }
 
@@ -504,12 +530,26 @@ struct FolderBackupView: View {
     private var folderListSection: some View {
         Section {
             Button {
-                manager.status = "正在打开「文件」App…"
+                debugTap = "主按钮 " + Date().formatted(date: .omitted, time: .standard)
                 showImporter = true
             } label: {
                 Label("添加手机文件夹", systemImage: "folder.badge.plus")
             }
-            .disabled(manager.running)
+
+            Button {
+                debugTap = "备用按钮 " + Date().formatted(date: .omitted, time: .standard)
+                if let error = FolderPickerService.shared.present(completion: { url in
+                    guard let url else { return }
+                    debugTap = "已选中 \(url.lastPathComponent)"
+                    _ = manager.addFolder(url)
+                }) {
+                    manager.status = "备用路径失败：\(error)"
+                }
+            } label: {
+                Label("备用：直接弹出选择器", systemImage: "folder")
+            }
+            .foregroundStyle(.secondary)
+
             ForEach(manager.folders) { folder in
                 HStack(spacing: 10) {
                     Image(systemName: "folder.fill").foregroundStyle(.tint)
