@@ -11,13 +11,19 @@ enum AlbumSource: String, CaseIterable, Identifiable {
 enum SyncRequest: Identifiable {
     case albums([String])
 
-    var id: String { albums.joined(separator: "|") }
-    var targets: [String] { albums }
+    var targets: [String] {
+        switch self {
+        case .albums(let list): return list
+        }
+    }
+
+    var id: String { targets.joined(separator: "|") }
 
     var title: String {
-        albums.count == 1
-            ? "同步「\(albums[0])」到手机相册？"
-            : "同步选中的 \(albums.count) 个相册？"
+        let list = targets
+        return list.count == 1
+            ? "同步「\(list[0])」到手机相册？"
+            : "同步选中的 \(list.count) 个相册？"
     }
 }
 
