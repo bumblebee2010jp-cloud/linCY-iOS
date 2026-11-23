@@ -129,11 +129,25 @@ struct WebContent: UIViewRepresentable {
 
         private var filePickerCompletion: (([URL]?) -> Void)?
 
-        /// WKWebView 默认不处理 <input type="file">，必须由宿主 App 弹出选择器。
-        /// 这是 WKUIDelegate 的 optional 方法，签名必须与 SDK 一致。
+        /// iOS 18.4 起 WKUIDelegate 才公开这个方法。
+        @available(iOS 18.4, *)
         func webView(_ webView: WKWebView, runOpenPanelWith parameters: WKOpenPanelParameters,
                      initiatedByFrame frame: WKFrameInfo,
                      completionHandler: @escaping ([URL]?) -> Void) {
+            presentOpenPanel(webView, parameters: parameters, completionHandler: completionHandler)
+        }
+
+        /// iOS 16 ~ 18.3 走 WebKit 内部的同名 SPI selector。
+        /// 方法名与协议要求不同，用 @objc 精确指定 selector，避免与公开协议方法冲突。
+        @objc(webView:runOpenPanelWithParameters:initiatedByFrame:completionHandler:)
+        func legacyRunOpenPanel(_ webView: WKWebView, parameters: NSObject,
+                                initiatedByFrame frame: WKFrameInfo,
+                                completionHandler: @escaping ([URL]?) -> Void) {
+            presentOpenPanel(webView, parameters: parameters, completionHandler: completionHandler)
+        }
+
+        private func presentOpenPanel(_ webView: WKWebView, parameters: NSObject,
+                                      completionHandler: @escaping ([URL]?) -> Void) {
             var allowsDirectories = false
             let selector = NSSelectorFromString("allowsDirectories")
             if parameters.responds(to: selector) {
