@@ -31,6 +31,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions:
         [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
         _ = BackupManager.shared
+        _ = FolderBackupManager.shared
         return true
     }
     func application(_ application: UIApplication, handleEventsForBackgroundURLSession identifier: String,
@@ -48,7 +49,6 @@ struct LinCYApp: App {
 
 struct ContentView: View {
     @StateObject private var backup = BackupManager.shared
-    @StateObject private var folderBackup = FolderBackupManager.shared
     @AppStorage("serverAddress") private var address = ""
     @AppStorage("wifiOnly") private var wifiOnly = true
     @State private var draft = ""
@@ -57,7 +57,6 @@ struct ContentView: View {
     @State private var albumSource: AlbumSource = .local
     @State private var syncRequest: SyncRequest?
     @State private var selectedRemote: Set<String> = []
-    @State private var showFolderPicker = false
     @State private var connectionStatus = ""
     @State private var connecting = false
     @State private var webToken = UUID()
@@ -65,269 +64,290 @@ struct ContentView: View {
 
     var body: some View {
         TabView {
-            NavigationStack {
-                if let url = URL(string: address), !address.isEmpty {
-                    WebScreen(url: url, cookie: webCookie).id(webToken)
-                        .navigationTitle("linCY").navigationBarTitleDisplayMode(.inline)
-                } else {
-                    VStack(spacing: 12) {
-                        Image(systemName: "network").font(.largeTitle)
-                        Text("先在“连接”页面填写电脑上的 linCY 访问地址")
-                            .multilineTextAlignment(.center)
-                    }.padding()
-                }
-            }.tabItem { Label("原版功能", systemImage: "globe") }
-            NavigationStack {
-                List {
-                    Section {
-                        Text(backup.status)
-                        if backup.running { ProgressView(value: backup.progress) }
-                        Text("上传 \(backup.uploaded) · 下载 \(backup.downloaded) · 已有 \(backup.skipped) · 失败 \(backup.failed)")
-                            .font(.footnote).foregroundStyle(.secondary)
-                        if backup.running {
-                            Button("停止当前任务") { backup.stop() }
-                        } else {
-                            Button {
-                                Task { await backup.start(address: address,
-                                    password: Credentials.password(for: address), wifiOnly: wifiOnly) }
-                            } label: { Label("开始备份", systemImage: "icloud.and.arrow.up") }
-                                .disabled(address.isEmpty || backup.selected.isEmpty || backup.restoring)
-                        }
-                    } footer: {
-                        Text("备份是手机 → 服务器：对比同名文件夹，缺少则新建，按文件名跳过已有文件，不覆盖、不删除。同步是服务器 → 手机：在下方切到「服务器相册」，点相册或「同步全部」下载缺失文件。首次备份建议保持此页在前台。")
-                    }
-                    Section {
-                        Picker("相册来源", selection: $albumSource) {
-                            ForEach(AlbumSource.allCases) { source in
-                                Text(source.rawValue).tag(source)
-                            }
-                        }
-                        .pickerStyle(.segmented)
-                    }
+            webTab
+            albumTab
+            FolderBackupView()
+                .tabItem { Label("文件夹备份", systemImage: "folder") }
+            connectionTab
+        }
+        .task { await restore() }
+    }
 
-                    if albumSource == .local {
-                    Section {
-                        Button("读取 / 刷新手机相册") { Task { await backup.loadAlbums() } }
-                            .disabled(backup.running)
-                        ForEach(visibleAlbums) { album in
-                            albumRow(album)
-                                .contextMenu {
-                                    Button(role: .destructive) {
-                                        backup.hide(album.id)
-                                    } label: { Label("隐藏此相册", systemImage: "eye.slash") }
-                                }
-                        }
-                        if !hiddenAlbums.isEmpty {
-                            DisclosureGroup(isExpanded: $showHiddenAlbums) {
-                                ForEach(hiddenAlbums) { album in
-                                    albumRow(album)
-                                        .contextMenu {
-                                            Button {
-                                                backup.unhide(album.id)
-                                            } label: { Label("取消隐藏", systemImage: "eye") }
-                                        }
-                                }
-                            } label: {
-                                Label("已隐藏相册（\(hiddenAlbums.count)）", systemImage: "eye.slash")
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                    } header: {
-                        Text("本机相册（\(visibleAlbums.count)）")
-                    } footer: {
-                        Text("长按相册可隐藏，隐藏的相册会移到底部「已隐藏相册」并取消勾选；需要时展开即可恢复。")
-                    }
-                    } else {
-                    Section {
-                        if backup.loadingRemote {
-                            HStack(spacing: 8) {
-                                ProgressView()
-                                Text("正在读取服务器相册…").foregroundStyle(.secondary)
-                            }
-                        } else if backup.remoteAlbums.isEmpty {
-                            Text("还没有读取。点右上角「读取 / 刷新」。")
-                                .font(.footnote).foregroundStyle(.secondary)
-                        } else {
-                            ForEach(backup.remoteAlbums, id: \.self) { name in
-                                Button {
-                                    if selectedRemote.contains(name) { selectedRemote.remove(name) }
-                                    else { selectedRemote.insert(name) }
-                                } label: {
-                                    HStack {
-                                        Image(systemName: selectedRemote.contains(name)
-                                              ? "checkmark.circle.fill" : "circle")
-                                        Text(name).foregroundStyle(.primary).lineLimit(1)
-                                        Spacer()
-                                    }
-                                }
-                                .disabled(backup.running || backup.restoring)
-                            }
-                            HStack {
-                                Button {
-                                    syncRequest = .albums(Array(selectedRemote).sorted())
-                                } label: {
-                                    Label("同步选中（\(selectedRemote.count)）",
-                                          systemImage: "arrow.down.circle")
-                                }
-                                .disabled(selectedRemote.isEmpty || backup.running || backup.restoring)
-                                Spacer()
-                                Button(selectedRemote.count == backup.remoteAlbums.count ? "取消全选" : "全选") {
-                                    if selectedRemote.count == backup.remoteAlbums.count {
-                                        selectedRemote.removeAll()
-                                    } else {
-                                        selectedRemote = Set(backup.remoteAlbums)
-                                    }
-                                }
-                                .disabled(backup.running)
-                            }
-                            Button {
-                                syncRequest = .albums(backup.remoteAlbums)
-                            } label: {
-                                Label("同步全部（\(backup.remoteAlbums.count) 个相册）",
-                                      systemImage: "arrow.down.circle.fill")
-                            }
-                            .disabled(backup.running || backup.restoring)
-                        }
-                    } header: {
-                        HStack {
-                            Text("服务器相册（\(backup.remoteAlbums.count)）")
-                            Spacer()
-                            Button {
-                                Task { await backup.loadRemoteAlbums(address: address,
-                                    password: Credentials.password(for: address), wifiOnly: wifiOnly) }
-                            } label: {
-                                Text(backup.loadingRemote ? "读取中…" : "读取 / 刷新")
-                                    .font(.footnote)
-                            }
-                            .disabled(backup.running || backup.loadingRemote)
-                        }
-                    } footer: {
-                        Text("点某个相册即可把它同步到手机同名相册：手机上没有该相册会新建，只下载缺失文件。与已隐藏手机相册同名的会跳过。")
-                    }
-                    }
-                    if !backup.logs.isEmpty {
-                        Section("本次记录") {
-                            ForEach(Array(backup.logs.enumerated()), id: \.offset) { _, text in
-                                Text(text).font(.caption).textSelection(.enabled)
-                            }
-                        }
-                    }
-                }.navigationTitle("相册备份")
-                    .onChange(of: albumSource) { source in
-                        guard source == .remote, backup.remoteAlbums.isEmpty,
-                              !address.isEmpty, !backup.loadingRemote, !backup.running else { return }
-                        Task { await backup.loadRemoteAlbums(address: address,
-                            password: Credentials.password(for: address), wifiOnly: wifiOnly) }
-                    }
-                    .confirmationDialog(syncRequest?.title ?? "", isPresented: Binding(
-                        get: { syncRequest != nil },
-                        set: { if !$0 { syncRequest = nil } }
-                    ), titleVisibility: .visible) {
-                        Button("开始同步") {
-                            guard let request = syncRequest else { return }
-                            let targets: [String]
-                            switch request {
-                            case .all: targets = backup.remoteAlbums
-                            case .album(let name): targets = [name]
-                            }
-                            Task { await backup.syncAlbums(targets, address: address,
-                                password: Credentials.password(for: address), wifiOnly: wifiOnly) }
-                        }
-                        Button("取消", role: .cancel) {}
-                    } message: {
-                        Text("对比服务器与手机相册，只下载手机里没有的文件；手机上缺的同名相册会自动新建。")
-                    }
-            }.tabItem { Label("相册备份", systemImage: "photo.on.rectangle.angled") }
-            NavigationStack {
-                List {
-                    Section {
-                        Text(folderBackup.status)
-                        if folderBackup.running { ProgressView(value: folderBackup.progress) }
-                        Text("上传 \(folderBackup.uploaded) · 跳过 \(folderBackup.skipped) · 失败 \(folderBackup.failed)")
-                            .font(.footnote).foregroundStyle(.secondary)
-                        if folderBackup.running {
-                            HStack(spacing: 8) {
-                                ProgressView()
-                                Text("正在同步，请保持此页在前台").font(.footnote).foregroundStyle(.secondary)
-                            }
-                        } else {
-                            Button {
-                                Task { await folderBackup.startSync(address: address,
-                                    password: Credentials.password(for: address), wifiOnly: wifiOnly) }
-                            } label: { Label("开始同步", systemImage: "arrow.triangle.2.circlepath") }
-                                .disabled(address.isEmpty || folderBackup.folders.isEmpty)
-                        }
-                    } footer: {
-                        Text("以手机文件夹为准，把内容（含所有子文件夹）上传到服务器「备份文件」根目录下的同名文件夹，服务器没有就新建。大小没变化的文件会跳过。")
-                    }
+    // MARK: - 原版功能
 
-                    Section {
-                        Button {
-                            showFolderPicker = true
-                        } label: { Label("添加手机文件夹", systemImage: "folder.badge.plus") }
-                            .disabled(folderBackup.running)
-                        ForEach(folderBackup.folders) { folder in
-                            HStack(spacing: 10) {
-                                Image(systemName: "folder.fill").foregroundStyle(.tint)
-                                Text(folder.displayName)
-                                Spacer()
-                            }
-                            .contextMenu {
-                                Button(role: .destructive) {
-                                    folderBackup.remove(folder.id)
-                                } label: { Label("移除", systemImage: "trash") }
-                            }
-                        }
-                    } header: {
-                        Text("手机文件夹（\(folderBackup.folders.count)）")
-                    } footer: {
-                        Text("可添加多个文件夹，长按可移除。移除只取消同步，不会删除手机或服务器上的文件。")
-                    }
+    private var webTab: some View {
+        NavigationStack {
+            webContent
+        }
+        .tabItem { Label("原版功能", systemImage: "globe") }
+    }
 
-                    if !folderBackup.logs.isEmpty {
-                        Section("本次记录") {
-                            ForEach(Array(folderBackup.logs.enumerated()), id: \.offset) { _, text in
-                                Text(text).font(.caption).textSelection(.enabled)
-                            }
-                        }
-                    }
-                }
-                .navigationTitle("文件夹备份")
-                .sheet(isPresented: $showFolderPicker) {
-                    FolderPicker { url in
-                        _ = folderBackup.addFolder(url)
-                    }
-                }
-            }.tabItem { Label("文件夹备份", systemImage: "folder") }
-            NavigationStack {
-                Form {
-                    Section("电脑上的 linCY 服务") {
-                        TextField("http://192.168.1.10:8091", text: $draft)
-                            .textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.URL)
-                        SecureField("访问密码（未设置则留空）", text: $password)
-                        Toggle("备份仅使用 Wi-Fi", isOn: $wifiOnly)
-                            .disabled(backup.running)
-                        Button(connecting ? "正在连接…" : "连接并保存") {
-                            Task { await connect() }
-                        }.disabled(connecting || backup.running)
-                        if !connectionStatus.isEmpty { Text(connectionStatus).font(.footnote) }
-                    }
-                    Section {
-                        Text("填写服务端“手机传输”的访问地址，默认端口 8091。手机需能访问电脑，服务端需保持开启。备份保存到服务端已配置的“相册备份文件夹”。")
-                        Text("相册内容只在你点击备份后上传。Live Photo 会分别备份原始照片与视频；仅 iCloud 中的原件会先下载。后台只尝试完成已提交的上传，其余内容下次手动继续。")
-                        Button("打开系统权限设置") {
-                            if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) }
-                        }
-                    }.font(.footnote)
-                }.navigationTitle("连接")
-            }.tabItem { Label("连接", systemImage: "gearshape") }
-        }.task {
-            draft = address
-            password = Credentials.password(for: address)
-            // Read remembered choices, but never start an upload on launch.
-            if !backup.selected.isEmpty { await backup.loadAlbums() }
+    @ViewBuilder
+    private var webContent: some View {
+        if address.isEmpty {
+            VStack(spacing: 12) {
+                Image(systemName: "network").font(.largeTitle)
+                Text("先在“连接”页面填写电脑上的 linCY 访问地址")
+                    .multilineTextAlignment(.center)
+            }
+            .padding()
+        } else if let url = URL(string: address) {
+            WebScreen(url: url, cookie: webCookie)
+                .id(webToken)
+                .navigationTitle("linCY")
+                .navigationBarTitleDisplayMode(.inline)
+        } else {
+            Text("地址无效，请到「连接」页重新填写").padding()
         }
     }
+
+    // MARK: - 相册备份
+
+    private var albumTab: some View {
+        NavigationStack {
+            List {
+                summarySection
+                sourceSection
+                if albumSource == .local {
+                    localAlbumsSection
+                } else {
+                    remoteAlbumsSection
+                }
+                logsSection
+            }
+            .navigationTitle("相册备份")
+            .onChange(of: albumSource) { source in
+                guard source == .remote, backup.remoteAlbums.isEmpty,
+                      !address.isEmpty, !backup.loadingRemote, !backup.running else { return }
+                Task { await loadRemoteAlbums() }
+            }
+            .confirmationDialog(
+                syncRequest?.title ?? "",
+                isPresented: Binding(
+                    get: { syncRequest != nil },
+                    set: { if !$0 { syncRequest = nil } }
+                ),
+                titleVisibility: .visible
+            ) {
+                Button("开始同步") {
+                    guard let request = syncRequest else { return }
+                    Task { await syncSelected(request.targets) }
+                }
+                Button("取消", role: .cancel) {}
+            } message: {
+                Text("对比服务器与手机相册，只下载手机里没有的文件；手机上缺的同名相册会自动新建。")
+            }
+        }
+        .tabItem { Label("相册备份", systemImage: "photo.on.rectangle.angled") }
+    }
+
+    @ViewBuilder
+    private var summarySection: some View {
+        Section {
+            Text(backup.status)
+            if backup.running {
+                ProgressView(value: backup.progress)
+            }
+            Text("上传 \(backup.uploaded) · 下载 \(backup.downloaded) · 已有 \(backup.skipped) · 失败 \(backup.failed)")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            if backup.running {
+                Button("停止当前任务") { backup.stop() }
+            } else {
+                Button {
+                    Task { await startBackup() }
+                } label: {
+                    Label("开始备份", systemImage: "icloud.and.arrow.up")
+                }
+                .disabled(address.isEmpty || backup.selected.isEmpty || backup.restoring)
+            }
+        } footer: {
+            Text("备份是手机 → 服务器：对比同名文件夹，缺少则新建，按文件名跳过已有文件，不覆盖、不删除。同步是服务器 → 手机：切到下方「服务器相册」勾选后下载缺失文件。")
+        }
+    }
+
+    private var sourceSection: some View {
+        Section {
+            Picker("相册来源", selection: $albumSource) {
+                ForEach(AlbumSource.allCases) { source in
+                    Text(source.rawValue).tag(source)
+                }
+            }
+            .pickerStyle(.segmented)
+        }
+    }
+
+    @ViewBuilder
+    private var localAlbumsSection: some View {
+        Section {
+            Button("读取 / 刷新手机相册") {
+                Task { await backup.loadAlbums() }
+            }
+            .disabled(backup.running)
+            ForEach(visibleAlbums) { album in
+                albumRow(album)
+                    .contextMenu {
+                        Button(role: .destructive) {
+                            backup.hide(album.id)
+                        } label: {
+                            Label("隐藏此相册", systemImage: "eye.slash")
+                        }
+                    }
+            }
+            if !hiddenAlbums.isEmpty {
+                DisclosureGroup(isExpanded: $showHiddenAlbums) {
+                    ForEach(hiddenAlbums) { album in
+                        albumRow(album)
+                            .contextMenu {
+                                Button {
+                                    backup.unhide(album.id)
+                                } label: {
+                                    Label("取消隐藏", systemImage: "eye")
+                                }
+                            }
+                    }
+                } label: {
+                    Label("已隐藏相册（\(hiddenAlbums.count)）", systemImage: "eye.slash")
+                        .foregroundStyle(.secondary)
+                }
+            }
+        } header: {
+            Text("本机相册（\(visibleAlbums.count)）")
+        } footer: {
+            Text("长按相册可隐藏，隐藏的相册会移到底部「已隐藏相册」并取消勾选；需要时展开即可恢复。")
+        }
+    }
+
+    @ViewBuilder
+    private var remoteAlbumsSection: some View {
+        Section {
+            if backup.loadingRemote {
+                HStack(spacing: 8) {
+                    ProgressView()
+                    Text("正在读取服务器相册…").foregroundStyle(.secondary)
+                }
+            } else if backup.remoteAlbums.isEmpty {
+                Text("还没有读取。点右上角「读取 / 刷新」。")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            } else {
+                remoteAlbumRows
+                remoteActions
+            }
+        } header: {
+            HStack {
+                Text("服务器相册（\(backup.remoteAlbums.count)）")
+                Spacer()
+                Button {
+                    Task { await loadRemoteAlbums() }
+                } label: {
+                    Text(backup.loadingRemote ? "读取中…" : "读取 / 刷新")
+                        .font(.footnote)
+                }
+                .disabled(backup.running || backup.loadingRemote)
+            }
+        } footer: {
+            Text("勾选后点「同步选中」，或直接「同步全部」。手机上没有的同名相册会新建，只下载缺失文件；与已隐藏手机相册同名的会跳过。")
+        }
+    }
+
+    private var remoteAlbumRows: some View {
+        ForEach(backup.remoteAlbums, id: \.self) { name in
+            Button {
+                toggleRemote(name)
+            } label: {
+                HStack {
+                    Image(systemName: selectedRemote.contains(name)
+                          ? "checkmark.circle.fill" : "circle")
+                    Text(name).foregroundStyle(.primary).lineLimit(1)
+                    Spacer()
+                }
+            }
+            .disabled(backup.running || backup.restoring)
+        }
+    }
+
+    @ViewBuilder
+    private var remoteActions: some View {
+        HStack {
+            Button {
+                syncRequest = .albums(Array(selectedRemote).sorted())
+            } label: {
+                Label("同步选中（\(selectedRemote.count)）", systemImage: "arrow.down.circle")
+            }
+            .disabled(selectedRemote.isEmpty || backup.running || backup.restoring)
+            Spacer()
+            Button(allRemoteSelected ? "取消全选" : "全选") {
+                toggleAllRemote()
+            }
+            .disabled(backup.running)
+        }
+        Button {
+            syncRequest = .albums(backup.remoteAlbums)
+        } label: {
+            Label("同步全部（\(backup.remoteAlbums.count) 个相册）",
+                  systemImage: "arrow.down.circle.fill")
+        }
+        .disabled(backup.running || backup.restoring)
+    }
+
+    @ViewBuilder
+    private var logsSection: some View {
+        if !backup.logs.isEmpty {
+            Section("本次记录") {
+                ForEach(Array(backup.logs.enumerated()), id: \.offset) { _, text in
+                    Text(text).font(.caption).textSelection(.enabled)
+                }
+            }
+        }
+    }
+
+    // MARK: - 连接
+
+    private var connectionTab: some View {
+        NavigationStack {
+            Form {
+                connectionFields
+                connectionHelp
+            }
+            .navigationTitle("连接")
+        }
+        .tabItem { Label("连接", systemImage: "gearshape") }
+    }
+
+    private var connectionFields: some View {
+        Section("电脑上的 linCY 服务") {
+            TextField("http://192.168.1.10:8091", text: $draft)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .keyboardType(.URL)
+            SecureField("访问密码（未设置则留空）", text: $password)
+            Toggle("备份仅使用 Wi-Fi", isOn: $wifiOnly)
+                .disabled(backup.running)
+            Button(connecting ? "正在连接…" : "连接并保存") {
+                Task { await connect() }
+            }
+            .disabled(connecting || backup.running)
+            if !connectionStatus.isEmpty {
+                Text(connectionStatus).font(.footnote)
+            }
+        }
+    }
+
+    private var connectionHelp: some View {
+        Section {
+            Text("填写服务端“手机传输”的访问地址，默认端口 8091。手机需能访问电脑，服务端需保持开启。相册备份写入“相册备份文件夹”，文件夹备份写入“备份文件”根目录。")
+            Text("相册内容只在你点击备份后上传。Live Photo 会分别备份原始照片与视频；仅 iCloud 中的原件会先下载。后台只尝试完成已提交的上传，其余内容下次手动继续。")
+            Button("打开系统权限设置") {
+                if let url = URL(string: UIApplication.openSettingsURLString) {
+                    UIApplication.shared.open(url)
+                }
+            }
+        }
+        .font(.footnote)
+    }
+
+    // MARK: - 数据
 
     private var visibleAlbums: [PhoneAlbum] {
         backup.albums.filter { !backup.hidden.contains($0.id) }
@@ -335,6 +355,10 @@ struct ContentView: View {
 
     private var hiddenAlbums: [PhoneAlbum] {
         backup.albums.filter { backup.hidden.contains($0.id) }
+    }
+
+    private var allRemoteSelected: Bool {
+        !backup.remoteAlbums.isEmpty && selectedRemote.count == backup.remoteAlbums.count
     }
 
     @ViewBuilder
@@ -353,7 +377,46 @@ struct ContentView: View {
         .disabled(backup.running)
     }
 
-    @MainActor private func connect() async {
+    // MARK: - 动作
+
+    private func toggleRemote(_ name: String) {
+        if selectedRemote.contains(name) { selectedRemote.remove(name) }
+        else { selectedRemote.insert(name) }
+    }
+
+    private func toggleAllRemote() {
+        if allRemoteSelected { selectedRemote.removeAll() }
+        else { selectedRemote = Set(backup.remoteAlbums) }
+    }
+
+    @MainActor
+    private func restore() async {
+        draft = address
+        password = Credentials.password(for: address)
+        // 读取记住的选择，但启动时绝不自动开始上传。
+        if !backup.selected.isEmpty { await backup.loadAlbums() }
+    }
+
+    @MainActor
+    private func startBackup() async {
+        await backup.start(address: address,
+            password: Credentials.password(for: address), wifiOnly: wifiOnly)
+    }
+
+    @MainActor
+    private func loadRemoteAlbums() async {
+        await backup.loadRemoteAlbums(address: address,
+            password: Credentials.password(for: address), wifiOnly: wifiOnly)
+    }
+
+    @MainActor
+    private func syncSelected(_ targets: [String]) async {
+        await backup.syncAlbums(targets, address: address,
+            password: Credentials.password(for: address), wifiOnly: wifiOnly)
+    }
+
+    @MainActor
+    private func connect() async {
         connecting = true
         defer { connecting = false }
         do {
@@ -366,12 +429,117 @@ struct ContentView: View {
             webCookie = cookie
             webToken = UUID()
             connectionStatus = "连接成功，已保存"
-        } catch { connectionStatus = error.localizedDescription }
+        } catch {
+            connectionStatus = error.localizedDescription
+        }
     }
 }
 
-/// 系统文件夹选择器。iOS 只能选文件夹，返回 security-scoped URL，
-/// 由 FolderBackupManager 转成 bookmark 以便长期访问。
+// MARK: - 文件夹备份
+
+struct FolderBackupView: View {
+    @StateObject private var manager = FolderBackupManager.shared
+    @AppStorage("serverAddress") private var address = ""
+    @AppStorage("wifiOnly") private var wifiOnly = true
+    @State private var showPicker = false
+
+    var body: some View {
+        NavigationStack {
+            List {
+                statusSection
+                folderListSection
+                logsSection
+            }
+            .navigationTitle("文件夹备份")
+            .sheet(isPresented: $showPicker) {
+                FolderPicker { url in
+                    _ = manager.addFolder(url)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var statusSection: some View {
+        Section {
+            Text(manager.status)
+            if manager.running {
+                ProgressView(value: manager.progress)
+            }
+            Text("上传 \(manager.uploaded) · 跳过 \(manager.skipped) · 失败 \(manager.failed)")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            if manager.running {
+                HStack(spacing: 8) {
+                    ProgressView()
+                    Text("正在同步，请保持此页在前台")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+            } else {
+                Button {
+                    Task { await start() }
+                } label: {
+                    Label("开始同步", systemImage: "arrow.triangle.2.circlepath")
+                }
+                .disabled(address.isEmpty || manager.folders.isEmpty)
+            }
+        } footer: {
+            Text("以手机文件夹为准，把内容（含所有子文件夹）上传到服务器「备份文件」根目录下的同名文件夹，服务器没有就新建。大小没变化的文件会跳过。")
+        }
+    }
+
+    @ViewBuilder
+    private var folderListSection: some View {
+        Section {
+            Button {
+                showPicker = true
+            } label: {
+                Label("添加手机文件夹", systemImage: "folder.badge.plus")
+            }
+            .disabled(manager.running)
+            ForEach(manager.folders) { folder in
+                HStack(spacing: 10) {
+                    Image(systemName: "folder.fill").foregroundStyle(.tint)
+                    Text(folder.displayName)
+                    Spacer()
+                }
+                .contextMenu {
+                    Button(role: .destructive) {
+                        manager.remove(folder.id)
+                    } label: {
+                        Label("移除", systemImage: "trash")
+                    }
+                }
+            }
+        } header: {
+            Text("手机文件夹（\(manager.folders.count)）")
+        } footer: {
+            Text("可添加多个文件夹，长按可移除。移除只取消同步，不会删除手机或服务器上的文件。")
+        }
+    }
+
+    @ViewBuilder
+    private var logsSection: some View {
+        if !manager.logs.isEmpty {
+            Section("本次记录") {
+                ForEach(Array(manager.logs.enumerated()), id: \.offset) { _, text in
+                    Text(text).font(.caption).textSelection(.enabled)
+                }
+            }
+        }
+    }
+
+    @MainActor
+    private func start() async {
+        await manager.startSync(address: address,
+            password: Credentials.password(for: address), wifiOnly: wifiOnly)
+    }
+}
+
+// MARK: - 系统文件夹选择器
+
+/// iOS 只能选文件夹，返回 security-scoped URL，由 FolderBackupManager 转成 bookmark 长期访问。
 struct FolderPicker: UIViewControllerRepresentable {
     let onPick: (URL) -> Void
     @Environment(\.dismiss) private var dismiss
@@ -379,7 +547,6 @@ struct FolderPicker: UIViewControllerRepresentable {
     func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
         let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.folder], asCopy: false)
         picker.allowsMultipleSelection = false
-        picker.shouldShowFileExtensions = true
         picker.delegate = context.coordinator
         return picker
     }
