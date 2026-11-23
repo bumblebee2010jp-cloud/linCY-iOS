@@ -16,8 +16,12 @@ struct SyncDiff: Codable, Sendable { let added: Int; let updated: Int; let skipp
 // iOS document-picker URLs embed the security scope in their bookmark. The macOS-only
 // .withSecurityScope option is intentionally not used on iOS.
 struct FolderAuthorization: Codable, Equatable, Sendable {
-    var bookmark: Data
+    /// 外部目录（iCloud Drive、其他 App 共享）用书签；App 自己 Documents 下的目录
+    /// 用相对路径更稳，书签在这种沙盒内路径上重启后容易解析失败。
+    var bookmark: Data?
+    var relativePath: String?
     var name: String
+
     static func capture(_ url: URL) throws -> Self {
         let access = try ScopedFolder(url)
         defer { access.close() }
@@ -26,24 +30,63 @@ struct FolderAuthorization: Codable, Equatable, Sendable {
             guard values.isDirectory == true, values.isSymbolicLink != true else {
                 throw AppError.message("请选择可访问的普通文件夹")
             }
-            // A real directory read distinguishes an empty folder from denied access.
+            // 真正读一次目录，用来区分「空文件夹」和「没有权限」。
             _ = try FileManager.default.contentsOfDirectory(at: coordinated, includingPropertiesForKeys: nil, options: [])
-            let bookmark = try coordinated.bookmarkData(options: .minimalBookmark, includingResourceValuesForKeys: nil, relativeTo: nil)
-            return Self(bookmark: bookmark, name: coordinated.lastPathComponent)
+
+            if let relative = Self.documentsRelativePath(coordinated) {
+                return Self(bookmark: nil, relativePath: relative, name: coordinated.lastPathComponent)
+            }
+            let bookmark = try coordinated.bookmarkData(options: .minimalBookmark,
+                                                        includingResourceValuesForKeys: nil,
+                                                        relativeTo: nil)
+            return Self(bookmark: bookmark, relativePath: nil, name: coordinated.lastPathComponent)
         }
     }
+
     mutating func resolve() throws -> URL {
+        if let relativePath {
+            let base = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            let url = base.appendingPathComponent(relativePath, isDirectory: true)
+            var isDir: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue else {
+                throw AppError.message("文件夹已不存在，请重新选择：\(name)")
+            }
+            name = url.lastPathComponent
+            return url
+        }
+
+        guard let bookmark else {
+            throw AppError.message("缺少文件夹授权，请重新选择：\(name)")
+        }
         var stale = false
         let url: URL
-        do { url = try URL(resolvingBookmarkData: bookmark, options: [.withoutUI], relativeTo: nil, bookmarkDataIsStale: &stale) }
-        catch { throw AppError.message("文件夹书签已失效，请重新选择：\(name)") }
+        do {
+            url = try URL(resolvingBookmarkData: bookmark, options: [.withoutUI],
+                          relativeTo: nil, bookmarkDataIsStale: &stale)
+        } catch {
+            throw AppError.message("文件夹书签已失效，请重新选择：\(name)")
+        }
         let access = try ScopedFolder(url)
         defer { access.close() }
         let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
-        guard values.isDirectory == true, values.isSymbolicLink != true else { throw AppError.message("文件夹已移动或不存在，请重新选择") }
-        if stale { bookmark = try url.bookmarkData(options: .minimalBookmark, includingResourceValuesForKeys: nil, relativeTo: nil) }
+        guard values.isDirectory == true, values.isSymbolicLink != true else {
+            throw AppError.message("文件夹已移动或不存在，请重新选择")
+        }
+        if stale {
+            self.bookmark = try url.bookmarkData(options: .minimalBookmark,
+                                                 includingResourceValuesForKeys: nil,
+                                                 relativeTo: nil)
+        }
         name = url.lastPathComponent
         return url
+    }
+
+    private static func documentsRelativePath(_ url: URL) -> String? {
+        let base = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .standardizedFileURL.path
+        let path = url.standardizedFileURL.path
+        guard path.hasPrefix(base + "/") else { return nil }
+        return String(path.dropFirst(base.count + 1))
     }
 }
 

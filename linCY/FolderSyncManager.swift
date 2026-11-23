@@ -61,7 +61,7 @@ struct SyncTotals: Codable {
             let endpoint = SyncEndpoint(name: "原服务器", address: server.base.absoluteString, wifiOnly: defaults.bool(forKey: "wifiOnly"))
             endpoints.append(endpoint)
             tasks = legacy.map { FolderSyncTask(name: $0.displayName, endpointID: endpoint.id, direction: .mirror,
-                local: FolderAuthorization(bookmark: $0.bookmark, name: $0.displayName),
+                local: FolderAuthorization(bookmark: $0.bookmark, relativePath: nil, name: $0.displayName),
                 remotePath: $0.displayName, area: "upload") }
             persist()
         }
