@@ -21,11 +21,16 @@ struct FolderAuthorization: Codable, Equatable, Sendable {
     static func capture(_ url: URL) throws -> Self {
         let access = try ScopedFolder(url)
         defer { access.close() }
-        let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
-        guard values.isDirectory == true, values.isSymbolicLink != true else {
-            throw AppError.message("请选择文件夹")
+        return try SyncFiles.coordinate(url) { coordinated in
+            let values = try coordinated.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+            guard values.isDirectory == true, values.isSymbolicLink != true else {
+                throw AppError.message("请选择可访问的普通文件夹")
+            }
+            // A real directory read distinguishes an empty folder from denied access.
+            _ = try FileManager.default.contentsOfDirectory(at: coordinated, includingPropertiesForKeys: nil, options: [])
+            let bookmark = try coordinated.bookmarkData(options: .minimalBookmark, includingResourceValuesForKeys: nil, relativeTo: nil)
+            return Self(bookmark: bookmark, name: coordinated.lastPathComponent)
         }
-        return Self(bookmark: try url.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil), name: url.lastPathComponent)
     }
     mutating func resolve() throws -> URL {
         var stale = false
@@ -36,7 +41,7 @@ struct FolderAuthorization: Codable, Equatable, Sendable {
         defer { access.close() }
         let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
         guard values.isDirectory == true, values.isSymbolicLink != true else { throw AppError.message("文件夹已移动或不存在，请重新选择") }
-        if stale { bookmark = try url.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil) }
+        if stale { bookmark = try url.bookmarkData(options: .minimalBookmark, includingResourceValuesForKeys: nil, relativeTo: nil) }
         name = url.lastPathComponent
         return url
     }
@@ -56,24 +61,72 @@ struct ScopedFolder {
     func close() { if started { url.stopAccessingSecurityScopedResource() } }
 }
 
+// Retain the security scope from the delegate callback until background authorization
+// finishes. No metadata lookup, symlink resolution or bookmark I/O runs in the callback.
+final class PickedFolder: @unchecked Sendable {
+    let url: URL
+    private let started: Bool
+    init(_ url: URL) {
+        self.url = url
+        started = url.startAccessingSecurityScopedResource()
+    }
+    deinit { if started { url.stopAccessingSecurityScopedResource() } }
+}
+
 struct NativeFolderPicker: UIViewControllerRepresentable {
-    var onPick: (URL) -> Void
+    var onPick: (PickedFolder) -> Void
     var onCancel: () -> Void
     func makeCoordinator() -> Coordinator { Coordinator(self) }
-    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
-        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [UTType.folder], asCopy: false)
-        picker.allowsMultipleSelection = false
-        picker.delegate = context.coordinator
-        return picker
+    func makeUIViewController(context: Context) -> FolderPickerHostController {
+        let host = FolderPickerHostController()
+        host.coordinator = context.coordinator
+        return host
     }
-    func updateUIViewController(_ controller: UIDocumentPickerViewController, context: Context) {}
+    func updateUIViewController(_ controller: FolderPickerHostController, context: Context) {
+        context.coordinator.parent = self
+    }
     final class Coordinator: NSObject, UIDocumentPickerDelegate {
-        let parent: NativeFolderPicker
+        var parent: NativeFolderPicker
+        private var completed = false
         init(_ parent: NativeFolderPicker) { self.parent = parent }
         func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
-            if let url = urls.first { parent.onPick(url) } else { parent.onCancel() }
+            guard !completed else { return }
+            completed = true
+            guard let url = urls.first else { finish(controller) { self.parent.onCancel() }; return }
+            let selection = PickedFolder(url)
+            finish(controller) { self.parent.onPick(selection) }
         }
-        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) { parent.onCancel() }
+        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+            guard !completed else { return }
+            completed = true
+            finish(controller) { self.parent.onCancel() }
+        }
+        private func finish(_ picker: UIDocumentPickerViewController, then callback: @escaping () -> Void) {
+            if picker.presentingViewController != nil { picker.dismiss(animated: true, completion: callback) }
+            else { callback() }
+        }
+    }
+}
+
+// UIKit owns the document browser presentation; SwiftUI owns only this full-screen
+// host. This avoids stacking a document browser sheet directly inside the task sheet.
+final class FolderPickerHostController: UIViewController {
+    var coordinator: NativeFolderPicker.Coordinator!
+    private var presentedPicker = false
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = .systemBackground
+    }
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        guard !presentedPicker else { return }
+        presentedPicker = true
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [UTType.folder], asCopy: false)
+        picker.allowsMultipleSelection = false
+        picker.shouldShowFileExtensions = true
+        picker.delegate = coordinator
+        picker.modalPresentationStyle = .fullScreen
+        present(picker, animated: true)
     }
 }
 

@@ -104,6 +104,11 @@ private struct SyncTaskEditor: View {
     @State private var area = "download"
     @State private var sharedRoot = true
     @State private var picking = false
+    @State private var pendingFolder: PickedFolder?
+    @State private var authorizing = false
+    @State private var selectionStatus = ""
+    @State private var authorizationID = UUID()
+    @State private var showSelectionError = false
     @State private var error = ""
     @State private var browsing = false
     @State private var children: [SyncEntry] = []
@@ -116,7 +121,14 @@ private struct SyncTaskEditor: View {
                     TextField("任务名称", text: $name)
                     Picker("服务器", selection: $endpointID) { ForEach(manager.endpoints) { Text($0.name).tag($0.id) } }
                     Picker("方向", selection: $direction) { ForEach(FolderDirection.allCases) { Text($0.rawValue).tag($0) } }
-                    Button(local == nil ? "选择手机文件夹" : "重新选择：\(local!.name)") { picking = true }
+                    Button(local == nil ? "选择手机文件夹" : "重新选择：\(local!.name)") {
+                        error = ""; selectionStatus = ""; picking = true
+                    }.disabled(authorizing)
+                    if authorizing {
+                        ProgressView("已选中，正在读取文件夹授权…")
+                        Button("取消读取") { authorizationID = UUID(); authorizing = false; selectionStatus = "已取消读取，可重新选择" }
+                    }
+                    if !selectionStatus.isEmpty { Text(selectionStatus).font(.caption).textSelection(.enabled) }
                     if let local { Text("已获得目录授权：\(local.name)").font(.caption) }
                 }
                 Section("服务器目录") {
@@ -144,20 +156,23 @@ private struct SyncTaskEditor: View {
                     }
                 }
                 if !error.isEmpty { Section { Text(error).foregroundStyle(.red) } }
-                Button("保存任务") { save() }
+                Button("保存任务") { save() }.disabled(authorizing || picking)
             }.navigationTitle(original == nil ? "新建同步任务" : "编辑同步任务")
                 .toolbar { Button("取消") { dismiss() } }
-                .sheet(isPresented: $picking) {
-                    NativeFolderPicker(onPick: { url in
-                        do {
-                            local = try FolderAuthorization.capture(url)
-                            if path.isEmpty { path = url.lastPathComponent }
-                            if name.isEmpty { name = url.lastPathComponent }
-                            error = ""
-                        } catch { self.error = error.localizedDescription }
+                .fullScreenCover(isPresented: $picking, onDismiss: authorizePickedFolder) {
+                    NativeFolderPicker(onPick: { selection in
+                        pendingFolder = selection
+                        selectionStatus = "已收到系统选择结果"
                         picking = false
-                    }, onCancel: { picking = false })
+                    }, onCancel: {
+                        pendingFolder = nil
+                        selectionStatus = "已取消选择"
+                        picking = false
+                    }).ignoresSafeArea()
                 }
+                .alert("文件夹授权失败", isPresented: $showSelectionError) {
+                    Button("好", role: .cancel) {}
+                } message: { Text(error) }
                 .onAppear {
                     guard !initialized else { return }
                     initialized = true
@@ -167,6 +182,37 @@ private struct SyncTaskEditor: View {
                         path = original.remotePath; area = original.area; sharedRoot = original.sharedRoot
                     }
                 }
+        }
+    }
+    private func authorizePickedFolder() {
+        guard let selected = pendingFolder else { return }
+        pendingFolder = nil
+        let requestID = UUID()
+        authorizationID = requestID
+        authorizing = true
+        selectionStatus = "已选中：\(selected.url.lastPathComponent)，正在验证读取权限"
+        Task { @MainActor in
+            // Let the dismissal finish before contacting a file provider. Retaining
+            // `selected` holds its original security scope throughout this operation.
+            do {
+                let authorization = try await Task.detached(priority: .userInitiated) {
+                    try FolderAuthorization.capture(selected.url)
+                }.value
+                guard authorizationID == requestID else { return }
+                local = authorization
+                if path.isEmpty { path = authorization.name }
+                if name.isEmpty { name = authorization.name }
+                error = ""
+                selectionStatus = "已获得授权：\(authorization.name)"
+            } catch {
+                guard authorizationID == requestID else { return }
+                let failure = error as NSError
+                self.error = "无法读取文件夹：\(failure.localizedDescription)\n错误：\(failure.domain) / \(failure.code)\n请重新选择“我的 iPhone”内可读取的文件夹。"
+                selectionStatus = "系统已返回选择结果，但授权验证失败"
+                showSelectionError = true
+            }
+            if authorizationID == requestID { authorizing = false }
+            withExtendedLifetime(selected) {}
         }
     }
     private func join(_ base: String, _ child: String) -> String { base.isEmpty ? child : base + "/" + child }

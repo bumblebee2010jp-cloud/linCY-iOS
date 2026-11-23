@@ -87,9 +87,37 @@ final class FolderSyncTests: XCTestCase {
         let temp = root.appendingPathComponent("snapshot")
         XCTAssertThrowsError(try SyncFiles.snapshot(root: root, entry: expected, to: temp))
     }
+    @MainActor func testPickerCompletionIsDeliveredOnlyOnce() {
+        var selected = 0
+        var cancelled = 0
+        let picker = NativeFolderPicker(onPick: { _ in selected += 1 }, onCancel: { cancelled += 1 })
+        let coordinator = picker.makeCoordinator()
+        let controller = UIDocumentPickerViewController(forOpeningContentTypes: [UTType.folder], asCopy: false)
+        coordinator.documentPicker(controller, didPickDocumentsAt: [root])
+        coordinator.documentPickerWasCancelled(controller)
+        coordinator.documentPicker(controller, didPickDocumentsAt: [root])
+        XCTAssertEqual(selected, 1); XCTAssertEqual(cancelled, 0)
+    }
+    @MainActor func testCancellationDoesNotReportASelection() {
+        var selected = 0
+        var cancelled = 0
+        let picker = NativeFolderPicker(onPick: { _ in selected += 1 }, onCancel: { cancelled += 1 })
+        let coordinator = picker.makeCoordinator()
+        let controller = UIDocumentPickerViewController(forOpeningContentTypes: [UTType.folder], asCopy: false)
+        coordinator.documentPickerWasCancelled(controller)
+        coordinator.documentPickerWasCancelled(controller)
+        XCTAssertEqual(selected, 0); XCTAssertEqual(cancelled, 1)
+    }
+    func testMinimalFolderBookmarkCanBeCreatedAndResolved() throws {
+        let captured = try FolderAuthorization.capture(root)
+        XCTAssertFalse(captured.bookmark.isEmpty)
+        var authorization = captured
+        let restored = try authorization.resolve()
+        XCTAssertEqual(restored.resolvingSymlinksInPath().path, root.resolvingSymlinksInPath().path)
+    }
     @MainActor func testNativePickerCallbackDeliversSelectedFolder() {
         var received: URL?
-        let picker = NativeFolderPicker(onPick: { received = $0 }, onCancel: {})
+        let picker = NativeFolderPicker(onPick: { received = $0.url }, onCancel: {})
         let coordinator = picker.makeCoordinator()
         let controller = UIDocumentPickerViewController(forOpeningContentTypes: [UTType.folder], asCopy: false)
         coordinator.documentPicker(controller, didPickDocumentsAt: [root])

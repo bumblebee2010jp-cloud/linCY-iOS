@@ -1,4 +1,4 @@
-# linCY iOS 0.2.8
+# linCY iOS 0.2.9
 
 在原生 0.2.7 工程上增加“文件夹同步”页，保留原网页、相册备份、相册反向同步和连接功能。
 
@@ -25,7 +25,7 @@ Mac 上用 Xcode 打开 `linCY.xcodeproj`，选择自己的签名 Team 和 Bundl
 python scripts/verify_folder_sync.py
 ```
 
-Mac 上执行 16 项 XCTest（文件夹回调、授权失败、递归 / 空文件夹、增量规则、保留额外文件、坏文件保护、旧 API 参数与错误处理）：
+Mac 上执行 19 项 XCTest（文件夹回调、授权失败、递归 / 空文件夹、增量规则、保留额外文件、坏文件保护、旧 API 参数与错误处理）：
 
 ```sh
 python3 scripts/run_ios_tests.py
@@ -34,3 +34,10 @@ python3 scripts/run_ios_tests.py
 本次已完成：Swift 语法解析、Xcode 工程引用 / plist / scheme 静态检查、旧接口参数核对、无自动删除请求检查和 ZIP 完整性检查。
 
 本次环境为 Windows，没有 Xcode；尚未执行 iOS 编译、上述 XCTest 或真机授权 / 文件提供器测试。新增 GitHub Actions “Native folder safety tests”可执行这些 XCTest。服务端源码与部署不属于本次交付变更。
+
+
+## 0.2.9 文件夹选择修正
+
+“文件夹同步 → 新建 / 编辑任务 → 选择手机文件夹”改为独立全屏 UIKit 文档选择器，并保持 delegate 的强引用。选择回调只保留安全作用域，退出选择器后在后台进行目录读取和 minimalBookmark 生成；界面显示授权进度和具体错误。取消读取时会忽略过期处理结果。选择器回调只交付一次，避免取消 / 重复回调覆盖已选结果。
+
+服务器、旧 API、网页手动删除和增量规则均未改动。新增选择回调、取消以及书签回归测试。Windows 上已完成静态检查和 Swift 语法解析，尚未执行 Xcode 编译、XCTest 或 iPhone 真机验证；这次修改针对源码中观察到的生命周期和主线程 I/O 风险，仍需在出问题的手机上确认。

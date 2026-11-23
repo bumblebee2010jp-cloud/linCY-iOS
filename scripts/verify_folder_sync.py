@@ -27,3 +27,13 @@ assert 'FolderBackupManager' not in ''.join(p.read_text(encoding='utf-8-sig') fo
 tests = (root/'linCYTests/FolderSyncTests.swift').read_text(encoding='utf-8-sig')
 print('PASS: native picker, bookmark/access balancing, old API contracts, no automatic delete, verified file replacement.')
 print('XCTest cases supplied:', len(re.findall(r'func test\w+\(', tests)), '(run on macOS with scripts/run_ios_tests.py)')
+
+view = (root/'linCY/FolderSyncView.swift').read_text(encoding='utf-8-sig')
+assert '.fullScreenCover(isPresented: $picking, onDismiss: authorizePickedFolder)' in view
+assert 'Task.detached(priority: .userInitiated)' in view
+assert 'FolderPickerHostController' in core and 'picker.modalPresentationStyle = .fullScreen' in core
+assert 'bookmarkData(options: .minimalBookmark' in core
+callback = core[core.index('func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls:'):core.index('func documentPickerWasCancelled',core.index('final class Coordinator'))]
+assert 'FolderAuthorization.capture' not in callback and 'resourceValues' not in callback and 'bookmarkData' not in callback
+assert 'guard !completed' in callback and 'PickedFolder(url)' in callback
+print('PASS: independent full-screen picker host, one-shot callback, retained scope, async authorization after dismissal.')
