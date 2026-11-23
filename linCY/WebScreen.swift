@@ -129,20 +129,14 @@ struct WebContent: UIViewRepresentable {
 
         private var filePickerCompletion: (([URL]?) -> Void)?
 
-        /// iOS 18.4 起 WKUIDelegate 才公开这个方法。
-        @available(iOS 18.4, *)
-        func webView(_ webView: WKWebView, runOpenPanelWith parameters: WKOpenPanelParameters,
-                     initiatedByFrame frame: WKFrameInfo,
-                     completionHandler: @escaping ([URL]?) -> Void) {
-            presentOpenPanel(webView, parameters: parameters, completionHandler: completionHandler)
-        }
-
-        /// iOS 16 ~ 18.3 走 WebKit 内部的同名 SPI selector。
-        /// 方法名与协议要求不同，用 @objc 精确指定 selector，避免与公开协议方法冲突。
+        /// WKWebView 默认不处理 <input type="file">，需要宿主弹选择器。
+        /// WebKit 用 selector `webView:runOpenPanelWithParameters:initiatedByFrame:completionHandler:`
+        /// 发起请求：iOS 18.4 起它对应公开 API，更早版本是 SPI，但 selector 完全相同。
+        /// 所以只实现一次即可覆盖全部系统版本；Swift 方法名另取，避免与协议要求重名。
         @objc(webView:runOpenPanelWithParameters:initiatedByFrame:completionHandler:)
-        func legacyRunOpenPanel(_ webView: WKWebView, parameters: NSObject,
-                                initiatedByFrame frame: WKFrameInfo,
-                                completionHandler: @escaping ([URL]?) -> Void) {
+        func handleOpenPanel(_ webView: WKWebView, parameters: NSObject,
+                             initiatedByFrame frame: WKFrameInfo,
+                             completionHandler: @escaping ([URL]?) -> Void) {
             presentOpenPanel(webView, parameters: parameters, completionHandler: completionHandler)
         }
 
