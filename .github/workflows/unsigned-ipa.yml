@@ -24,9 +24,11 @@ concurrency:
 
 jobs:
   build:
-    # macOS 14 镜像已于 2026-11-02 全部退役，必须用 macos-15
-    runs-on: macos-15
-    timeout-minutes: 30
+    # macOS 14 镜像已于 2026-11-02 全部退役，必须用 15 及以上。
+    # arm64 池（macos-15）在高峰时段经常排队 15 分钟后被回收，
+    # 这里改用 Intel 池（macos-15-intel），两者是独立的 runner 资源。
+    runs-on: macos-15-intel
+    timeout-minutes: 45
     env:
       PROJECT: linCY.xcodeproj
       SCHEME: linCY
