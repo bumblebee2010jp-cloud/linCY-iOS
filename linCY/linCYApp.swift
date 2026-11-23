@@ -276,19 +276,22 @@ struct ContentView: View {
 
     @ViewBuilder
     private var remoteActions: some View {
-        HStack {
-            Button {
-                syncRequest = .albums(Array(selectedRemote).sorted())
-            } label: {
-                Label("同步选中（\(selectedRemote.count)）", systemImage: "arrow.down.circle")
-            }
-            .disabled(selectedRemote.isEmpty || backup.running || backup.restoring)
-            Spacer()
-            Button(allRemoteSelected ? "取消全选" : "全选") {
-                toggleAllRemote()
-            }
-            .disabled(backup.running)
+        // List 里同一行放多个 Button 时，整行会被当成一个可点区域互相抢占，
+        // 因此每个操作各自占一行。
+        Button {
+            syncRequest = .albums(Array(selectedRemote).sorted())
+        } label: {
+            Label("同步选中（\(selectedRemote.count)）", systemImage: "arrow.down.circle")
         }
+        .disabled(selectedRemote.isEmpty || backup.running || backup.restoring)
+
+        Button {
+            toggleAllRemote()
+        } label: {
+            Label(allRemoteSelected ? "取消全选" : "全选", systemImage: "checklist")
+        }
+        .disabled(backup.running)
+
         Button {
             syncRequest = .albums(backup.remoteAlbums)
         } label: {
