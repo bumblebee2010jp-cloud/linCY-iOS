@@ -29,7 +29,7 @@ enum Credentials {
     }
 }
 
-struct Server {
+struct Server: @unchecked Sendable {
     let base: URL
     let session: URLSession
 
@@ -125,5 +125,47 @@ struct Server {
         r.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
         r.setValue(String(size), forHTTPHeaderField: "Content-Length")
         return r
+    }
+
+    // MARK: - 相册反向同步（服务器 → 手机）
+
+    struct AlbumPage: Decodable {
+        struct Item: Decodable {
+            let name: String
+            let kind: String      // "image" / "video"
+        }
+        let photos: [Item]
+        let total: Int
+        let nextOffset: Int?
+
+        enum CodingKeys: String, CodingKey {
+            case photos, total
+            case nextOffset = "next_offset"
+        }
+    }
+
+    /// GET /api/album/photos?album=&offset= — 服务端固定每页返回 12 条。
+    func photos(album: String, offset: Int, cookie: String) async throws -> AlbumPage {
+        let (data, _) = try await send(request("api/album/photos", query: [
+            URLQueryItem(name: "album", value: album),
+            URLQueryItem(name: "offset", value: String(offset))
+        ], cookie: cookie))
+        return try JSONDecoder().decode(AlbumPage.self, from: data)
+    }
+
+    /// GET /api/album/photo?album=&name= — 下载原始文件到指定位置。
+    func downloadPhoto(album: String, name: String, cookie: String, to destination: URL) async throws {
+        let req = request("api/album/photo", query: [
+            URLQueryItem(name: "album", value: album),
+            URLQueryItem(name: "name", value: name)
+        ], cookie: cookie)
+        let (temp, response) = try await session.download(for: req)
+        let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard (200..<300).contains(code) else {
+            try? FileManager.default.removeItem(at: temp)
+            throw AppError.message("下载 \(name) HTTP \(code)")
+        }
+        try? FileManager.default.removeItem(at: destination)
+        try FileManager.default.moveItem(at: temp, to: destination)
     }
 }

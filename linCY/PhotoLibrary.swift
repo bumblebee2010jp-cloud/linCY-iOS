@@ -81,4 +81,69 @@ enum PhotoLibrary {
             }
         }
     }
+
+    // MARK: - 反向同步：服务器 → 手机相册
+
+    /// 相册内已有文件的原始文件名集合（小写），用于和服务器对比。
+    /// 上传统一用 originalFilename 命名，所以两端能对得上。
+    static func existingFilenames(in collection: PHAssetCollection) async -> Set<String> {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let assets = PHAsset.fetchAssets(in: collection, options: nil)
+                var names = Set<String>()
+                names.reserveCapacity(assets.count)
+                assets.enumerateObjects { asset, _, _ in
+                    if let resource = PHAssetResource.assetResources(for: asset).first {
+                        names.insert(resource.originalFilename.lowercased())
+                    }
+                }
+                continuation.resume(returning: names)
+            }
+        }
+    }
+
+    /// 按标题查找用户相册（不匹配智能相册）。
+    static func album(named title: String) -> PHAssetCollection? {
+        let result = PHAssetCollection.fetchAssetCollections(with: .album,
+            subtype: .albumRegular, options: nil)
+        var found: PHAssetCollection?
+        result.enumerateObjects { collection, _, stop in
+            if collection.localizedTitle == title {
+                found = collection
+                stop.pointee = true
+            }
+        }
+        return found
+    }
+
+    /// 没有同名相册时新建一个。
+    static func ensureAlbum(named title: String) async throws -> PHAssetCollection {
+        if let existing = album(named: title) { return existing }
+
+        var placeholder: PHObjectPlaceholder?
+        try await PHPhotoLibrary.shared().performChanges {
+            let request = PHAssetCollectionChangeRequest.creationRequestForAssetCollection(withTitle: title)
+            placeholder = request.placeholderForCreatedAssetCollection
+        }
+        guard let identifier = placeholder?.localIdentifier,
+              let created = PHAssetCollection.fetchAssetCollections(
+                withLocalIdentifiers: [identifier], options: nil).firstObject
+        else { throw AppError.message("创建相册失败：\(title)") }
+        return created
+    }
+
+    /// 把下载好的临时文件存进指定相册。文件会被 PhotoKit 移走，调用方无需再删。
+    static func saveDownloaded(fileURL: URL, kind: String, into collection: PHAssetCollection) async throws {
+        let type: PHAssetResourceType = (kind == "video") ? .video : .photo
+        try await PHPhotoLibrary.shared().performChanges {
+            let request = PHAssetCreationRequest.forAsset()
+            let options = PHAssetResourceCreationOptions()
+            options.shouldMoveFile = true
+            request.addResource(with: type, fileURL: fileURL, options: options)
+            if let albumChange = PHAssetCollectionChangeRequest(for: collection),
+               let placeholder = request.placeholderForCreatedAsset {
+                albumChange.addAssets([placeholder] as NSArray)
+            }
+        }
+    }
 }

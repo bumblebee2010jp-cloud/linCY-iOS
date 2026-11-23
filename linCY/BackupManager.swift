@@ -10,6 +10,10 @@ final class BackupManager: NSObject, ObservableObject, URLSessionDataDelegate {
     @Published var selected = Set(UserDefaults.standard.stringArray(forKey: "selectedAlbums") ?? []) {
         didSet { UserDefaults.standard.set(Array(selected), forKey: "selectedAlbums") }
     }
+    /// 用户长按隐藏的相册。隐藏后移出主列表、显示在底部「已隐藏相册」分组，并取消勾选。
+    @Published var hidden = Set(UserDefaults.standard.stringArray(forKey: "hiddenAlbums") ?? []) {
+        didSet { UserDefaults.standard.set(Array(hidden), forKey: "hiddenAlbums") }
+    }
     @Published var running = false
     @Published var restoring = true
     @Published var status = "选择相册后，点击开始备份"
@@ -17,6 +21,7 @@ final class BackupManager: NSObject, ObservableObject, URLSessionDataDelegate {
     @Published var uploaded = 0
     @Published var skipped = 0
     @Published var failed = 0
+    @Published var downloaded = 0
     @Published var progress: Double = 0
     var backgroundCompletion: (() -> Void)?
     private var session: URLSession!
@@ -60,10 +65,22 @@ final class BackupManager: NSObject, ObservableObject, URLSessionDataDelegate {
             albums = try await PhotoLibrary.load()
             let visible = Set(albums.map(\.id))
             selected.formIntersection(visible)
+            // 相册被删除或重建后，隐藏记录里会留下无效 ID，顺手清掉。
+            hidden.formIntersection(visible)
             if PHPhotoLibrary.authorizationStatus(for: .readWrite) == .limited {
                 status = "当前仅能备份你授权的部分照片；如需完整相册，请在系统设置允许所有照片"
             }
         } catch { status = error.localizedDescription }
+    }
+
+    /// 长按隐藏：移出主列表，同时取消勾选，避免下次误备份。
+    func hide(_ albumID: String) {
+        hidden.insert(albumID)
+        selected.remove(albumID)
+    }
+
+    func unhide(_ albumID: String) {
+        hidden.remove(albumID)
     }
 
     func stop() {
@@ -100,6 +117,9 @@ final class BackupManager: NSObject, ObservableObject, URLSessionDataDelegate {
                 folder = try await server.ensureAlbum(folder, known: &known, cookie: cookie)
                 log("相册 \(album.title) → 服务器 /\(folder)")
                 let assets = PHAsset.fetchAssets(in: album.collection, options: PhotoLibrary.options())
+
+                // 第一步：本地汇总本相册的全部文件，纯内存操作，不产生网络请求。
+                // 同名资源需要加短 ID 后缀区分，先统计一次重名情况。
                 var counts: [String: Int] = [:]
                 assets.enumerateObjects { asset, _, _ in
                     for resource in PhotoLibrary.resources(asset) {
@@ -107,41 +127,56 @@ final class BackupManager: NSObject, ObservableObject, URLSessionDataDelegate {
                         counts[name, default: 0] += 1
                     }
                 }
-                for index in 0..<assets.count {
-                    try checkStop()
-                    let asset = assets.object(at: index)
+
+                struct Entry { let resource: PHAssetResource; let name: String }
+                var entries: [Entry] = []
+                entries.reserveCapacity(assets.count)
+                assets.enumerateObjects { asset, _, _ in
                     for resource in PhotoLibrary.resources(asset) {
-                        try checkStop()
                         let plain = PhotoLibrary.resourceName(resource, asset: asset, duplicated: false)
                         let name = PhotoLibrary.resourceName(resource, asset: asset,
                             duplicated: (counts[plain.lowercased()] ?? 0) > 1)
-                        do {
-                            if try await server.exists(album: folder, name: name, cookie: cookie) {
-                                skipped += 1
-                                continue
-                            }
-                            status = "正在备份 \(album.title)：\(name)"
-                            let temp = try exportURL()
-                            defer { try? fileManager.removeItem(at: temp) }
-                            try await PhotoLibrary.export(resource, to: temp)
-                            try checkStop()
-                            let attrs = try fileManager.attributesOfItem(atPath: temp.path)
-                            let size = (attrs[.size] as? NSNumber)?.int64Value ?? 0
-                            guard size <= 20 * 1024 * 1024 * 1024 else {
-                                throw AppError.message("单个文件超过服务器 20 GiB 限制")
-                            }
-                            let request = server.uploadRequest(album: folder, name: name, cookie: cookie, size: size)
-                            let wasSkipped = try await upload(request, file: temp, name: name, wifiOnly: wifiOnly)
-                            if wasSkipped { skipped += 1 } else { uploaded += 1 }
-                            log(wasSkipped ? "服务器已有：\(name)" : "已备份：\(name)")
-                        } catch {
-                            failed += 1
-                            log("失败 \(name)：\(error.localizedDescription)")
-                            // Authentication/network failures should not hammer the server for every photo.
-                            if error is URLError || error.localizedDescription.contains("HTTP 401") ||
-                                error.localizedDescription.contains("HTTP 429") { throw error }
-                            if stopRequested { throw CancellationError() }
+                        entries.append(Entry(resource: resource, name: name))
+                    }
+                }
+
+                // 第二步：并发查重。原来是每个文件一次串行 exists，往返次数等于文件数；
+                // 现在按固定窗口并发，往返次数降到 1/parallel。
+                status = "正在对比 \(album.title)：0 / \(entries.count)"
+                let existing = try await existingNames(server: server, album: folder,
+                    names: entries.map(\.name), cookie: cookie) { done, total in
+                    status = "正在对比 \(album.title)：\(done) / \(total)"
+                }
+                skipped += existing.count
+                log("相册 \(album.title)：共 \(entries.count) 个文件，服务器已有 \(existing.count) 个")
+
+                // 第三步：只上传缺失文件。上传仍逐个串行（后台 URLSession 单任务模型）。
+                for entry in entries {
+                    try checkStop()
+                    if existing.contains(entry.name) { continue }
+                    let name = entry.name
+                    do {
+                        status = "正在备份 \(album.title)：\(name)"
+                        let temp = try exportURL()
+                        defer { try? fileManager.removeItem(at: temp) }
+                        try await PhotoLibrary.export(entry.resource, to: temp)
+                        try checkStop()
+                        let attrs = try fileManager.attributesOfItem(atPath: temp.path)
+                        let size = (attrs[.size] as? NSNumber)?.int64Value ?? 0
+                        guard size <= 20 * 1024 * 1024 * 1024 else {
+                            throw AppError.message("单个文件超过服务器 20 GiB 限制")
                         }
+                        let request = server.uploadRequest(album: folder, name: name, cookie: cookie, size: size)
+                        let wasSkipped = try await upload(request, file: temp, name: name, wifiOnly: wifiOnly)
+                        if wasSkipped { skipped += 1 } else { uploaded += 1 }
+                        log(wasSkipped ? "服务器已有：\(name)" : "已备份：\(name)")
+                    } catch {
+                        failed += 1
+                        log("失败 \(name)：\(error.localizedDescription)")
+                        // Authentication/network failures should not hammer the server for every photo.
+                        if error is URLError || error.localizedDescription.contains("HTTP 401") ||
+                            error.localizedDescription.contains("HTTP 429") { throw error }
+                        if stopRequested { throw CancellationError() }
                     }
                 }
             }
@@ -152,6 +187,219 @@ final class BackupManager: NSObject, ObservableObject, URLSessionDataDelegate {
             status = "本轮中止：\(error.localizedDescription)。修复后点击开始备份重试"
             log(status)
         }
+    }
+
+    // MARK: - 反向同步：服务器相册 → 手机相册
+
+    /// 把服务器上的每个相册文件夹同步到手机同名相册：不存在就新建，
+    /// 只下载手机里没有的文件（按原始文件名比对，和上传用的是同一套命名）。
+    @MainActor func syncFromServer(address: String, password: String, wifiOnly: Bool) async {
+        guard !running, !restoring else { return }
+        running = true
+        stopRequested = false
+        uploaded = 0; skipped = 0; failed = 0; downloaded = 0; progress = 0
+        grace = UIApplication.shared.beginBackgroundTask(withName: "Sync albums from server") { [weak self] in
+            DispatchQueue.main.async {
+                self?.stopRequested = true
+                self?.endGrace()
+            }
+        }
+        defer { running = false; endGrace(); progress = 0 }
+
+        do {
+            let server = try Server(address: address, wifiOnly: wifiOnly)
+            let cookie = try await server.login(password: password)
+            let remoteAlbums = try await server.albums(cookie: cookie)
+            log("服务器上有 \(remoteAlbums.count) 个相册")
+
+            // 手机上被隐藏的相册，同名的不再往回同步。
+            var hiddenNames = Set<String>()
+            for album in albums where hidden.contains(album.id) {
+                hiddenNames.insert(album.title)
+                hiddenNames.insert(PhotoLibrary.safeName(album.title))
+            }
+
+            var index = 0
+            for remoteName in remoteAlbums {
+                try checkStop()
+                index += 1
+                let title = remoteName.split(separator: "/").last.map(String.init) ?? remoteName
+                if hiddenNames.contains(remoteName) || hiddenNames.contains(title) {
+                    log("跳过已隐藏相册：\(remoteName)")
+                    continue
+                }
+
+                status = "对比服务器相册 \(index)/\(remoteAlbums.count)：\(remoteName)"
+                let items = try await remotePhotos(server: server, album: remoteName, cookie: cookie)
+                if items.isEmpty {
+                    log("\(remoteName)：服务器上没有可同步的图片或视频")
+                    continue
+                }
+
+                let collection = try await PhotoLibrary.ensureAlbum(named: title)
+                let existing = await PhotoLibrary.existingFilenames(in: collection)
+                let missing = items.filter { !existing.contains($0.name.lowercased()) }
+                skipped += items.count - missing.count
+                log("\(remoteName)：共 \(items.count) 个，手机已有 \(items.count - missing.count) 个，待下载 \(missing.count) 个")
+                if missing.isEmpty { continue }
+
+                let staging = try stagingDirectory()
+                for item in missing {
+                    try checkStop()
+                    status = "下载 \(remoteName)：\(item.name)"
+                    let target = staging.appendingPathComponent(UUID().uuidString + "-" + item.name)
+                    do {
+                        try await server.downloadPhoto(album: remoteName, name: item.name,
+                            cookie: cookie, to: target)
+                        try await PhotoLibrary.saveDownloaded(fileURL: target, kind: item.kind, into: collection)
+                        downloaded += 1
+                        log("已同步：\(item.name)")
+                    } catch {
+                        failed += 1
+                        log("失败 \(item.name)：\(error.localizedDescription)")
+                        try? fileManager.removeItem(at: target)
+                        if error is URLError || error.localizedDescription.contains("HTTP 401") ||
+                            error.localizedDescription.contains("HTTP 429") { throw error }
+                        if stopRequested { throw CancellationError() }
+                    }
+                }
+            }
+            await loadAlbums()
+            status = "同步完成：下载 \(downloaded)，已有跳过 \(skipped)，失败 \(failed)"
+        } catch is CancellationError {
+            status = "已停止；下次点击同步会重新对比"
+        } catch {
+            status = "同步中止：\(error.localizedDescription)"
+            log(status)
+        }
+    }
+
+    /// 分页拉取服务器某个相册的全部文件。
+    /// 服务端固定每页 12 条，首屏拿到 total 后并发补齐其余页。
+    @MainActor
+    private func remotePhotos(server: Server, album: String, cookie: String)
+        async throws -> [(name: String, kind: String)] {
+        let first = try await server.photos(album: album, offset: 0, cookie: cookie)
+
+        var seen = Set<String>()
+        var result: [(name: String, kind: String)] = []
+        result.reserveCapacity(first.total)
+        for item in first.photos where seen.insert(item.name).inserted {
+            result.append((item.name, item.kind))
+        }
+        guard first.total > result.count, !first.photos.isEmpty else { return result }
+
+        let pageSize = first.photos.count
+        var offsets: [Int] = []
+        var cursor = pageSize
+        while cursor < first.total {
+            offsets.append(cursor)
+            cursor += pageSize
+        }
+
+        let parallel = 5
+        var index = 0
+        while index < offsets.count {
+            try checkStop()
+            let end = min(index + parallel, offsets.count)
+            let chunk = Array(offsets[index..<end])
+            let pages: [Server.AlbumPage] = await withTaskGroup(of: Server.AlbumPage?.self) { group in
+                for offset in chunk {
+                    group.addTask {
+                        try? await server.photos(album: album, offset: offset, cookie: cookie)
+                    }
+                }
+                var collected: [Server.AlbumPage] = []
+                for await page in group {
+                    if let page { collected.append(page) }
+                }
+                return collected
+            }
+            for page in pages {
+                for item in page.photos where seen.insert(item.name).inserted {
+                    result.append((item.name, item.kind))
+                }
+            }
+            index = end
+        }
+        return result
+    }
+
+    /// 同步下载的中转目录（不参与 iCloud 备份）。
+    private func stagingDirectory() throws -> URL {
+        let folder = fileManager.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("SyncDownloads", isDirectory: true)
+        try fileManager.createDirectory(at: folder, withIntermediateDirectories: true)
+        var excluded = folder
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        try? excluded.setResourceValues(values)
+        return folder
+    }
+
+    /// 用固定窗口并发查询服务器上已存在的文件名。
+    /// 原来每个文件一次串行 exists，往返次数等于文件数；这里降到 ceil(N / parallel)，
+    /// 对比阶段的主要提速点。
+    @MainActor
+    private func existingNames(server: Server, album: String, names: [String], cookie: String,
+                               parallel: Int = 6,
+                               progress: (Int, Int) -> Void) async throws -> Set<String> {
+        guard !names.isEmpty else { return [] }
+
+        var existing = Set<String>(minimumCapacity: names.count)
+        var unconfirmed = 0
+        let total = names.count
+        var cursor = 0
+
+        while cursor < total {
+            if stopRequested { throw CancellationError() }
+            let end = min(cursor + parallel, total)
+            let chunk = Array(names[cursor..<end])
+
+            let results: [(String, Bool?, String)] =
+                await withTaskGroup(of: (String, Bool?, String).self) { group in
+                    for name in chunk {
+                        group.addTask {
+                            do {
+                                let hit = try await server.exists(album: album, name: name, cookie: cookie)
+                                return (name, hit, "")
+                            } catch {
+                                return (name, nil, error.localizedDescription)
+                            }
+                        }
+                    }
+                    var collected: [(String, Bool?, String)] = []
+                    collected.reserveCapacity(chunk.count)
+                    for await item in group { collected.append(item) }
+                    return collected
+                }
+
+            var chunkFailures = 0
+            var firstMessage = ""
+            for (name, hit, message) in results {
+                if let hit {
+                    if hit { existing.insert(name) }
+                } else {
+                    chunkFailures += 1
+                    if firstMessage.isEmpty { firstMessage = message }
+                }
+            }
+            unconfirmed += chunkFailures
+
+            // 一批里大半都失败，基本可以断定网络或服务端出了问题，别再空转。
+            if chunkFailures > chunk.count / 2 {
+                throw AppError.message("查重失败 \(chunkFailures)/\(chunk.count)：\(firstMessage.isEmpty ? "未知错误" : firstMessage)")
+            }
+
+            cursor = end
+            progress(cursor, total)
+            try checkStop()
+        }
+
+        if unconfirmed > 0 {
+            log("有 \(unconfirmed) 个文件查重未确认，已按「服务器没有」处理，交给上传接口确认")
+        }
+        return existing
     }
 
     private func checkStop() throws {

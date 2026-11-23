@@ -26,6 +26,8 @@ struct ContentView: View {
     @AppStorage("wifiOnly") private var wifiOnly = true
     @State private var draft = ""
     @State private var password = ""
+    @State private var showHiddenAlbums = false
+    @State private var confirmSync = false
     @State private var connectionStatus = ""
     @State private var connecting = false
     @State private var webToken = UUID()
@@ -50,37 +52,56 @@ struct ContentView: View {
                     Section {
                         Text(backup.status)
                         if backup.running { ProgressView(value: backup.progress) }
-                        Text("已上传 \(backup.uploaded) · 已有 \(backup.skipped) · 失败 \(backup.failed)")
+                        Text("上传 \(backup.uploaded) · 下载 \(backup.downloaded) · 已有 \(backup.skipped) · 失败 \(backup.failed)")
                             .font(.footnote).foregroundStyle(.secondary)
                         if backup.running {
-                            Button("停止后续备份") { backup.stop() }
+                            Button("停止当前任务") { backup.stop() }
                         } else {
                             Button {
                                 Task { await backup.start(address: address,
                                     password: Credentials.password(for: address), wifiOnly: wifiOnly) }
                             } label: { Label("开始备份", systemImage: "icloud.and.arrow.up") }
                                 .disabled(address.isEmpty || backup.selected.isEmpty || backup.restoring)
+
+                            Button {
+                                confirmSync = true
+                            } label: { Label("从服务器同步到相册", systemImage: "arrow.down.circle") }
+                                .disabled(address.isEmpty || backup.restoring)
                         }
                     } footer: {
-                        Text("每次手动点击才开始。自动对比同名文件夹，缺少则新建；按文件名跳过已有文件，不覆盖、不删除。首次备份建议保持此页在前台。")
+                        Text("每次手动点击才开始。备份是手机 → 服务器：自动对比同名文件夹，缺少则新建；按文件名跳过已有文件，不覆盖、不删除。同步是服务器 → 手机：同名相册不存在就新建，只下载手机里没有的文件。首次备份建议保持此页在前台。")
                     }
                     Section {
                         Button("读取 / 刷新手机相册") { Task { await backup.loadAlbums() } }
                             .disabled(backup.running)
-                        ForEach(backup.albums) { album in
-                            Button {
-                                if backup.selected.contains(album.id) { backup.selected.remove(album.id) }
-                                else { backup.selected.insert(album.id) }
-                            } label: {
-                                HStack {
-                                    Image(systemName: backup.selected.contains(album.id) ? "checkmark.circle.fill" : "circle")
-                                    Text(album.title).foregroundStyle(.primary)
-                                    Spacer()
-                                    Text("\(album.count)").foregroundStyle(.secondary)
+                        ForEach(visibleAlbums) { album in
+                            albumRow(album)
+                                .contextMenu {
+                                    Button(role: .destructive) {
+                                        backup.hide(album.id)
+                                    } label: { Label("隐藏此相册", systemImage: "eye.slash") }
                                 }
-                            }.disabled(backup.running)
                         }
-                    } header: { Text("选择要备份的相册（自动记住）") }
+                        if !hiddenAlbums.isEmpty {
+                            DisclosureGroup(isExpanded: $showHiddenAlbums) {
+                                ForEach(hiddenAlbums) { album in
+                                    albumRow(album)
+                                        .contextMenu {
+                                            Button {
+                                                backup.unhide(album.id)
+                                            } label: { Label("取消隐藏", systemImage: "eye") }
+                                        }
+                                }
+                            } label: {
+                                Label("已隐藏相册（\(hiddenAlbums.count)）", systemImage: "eye.slash")
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    } header: {
+                        Text("选择要备份的相册（自动记住）")
+                    } footer: {
+                        Text("长按相册可隐藏，隐藏的相册会移到底部「已隐藏相册」并取消勾选；需要时展开即可恢复。")
+                    }
                     if !backup.logs.isEmpty {
                         Section("本次记录") {
                             ForEach(Array(backup.logs.enumerated()), id: \.offset) { _, text in
@@ -89,6 +110,16 @@ struct ContentView: View {
                         }
                     }
                 }.navigationTitle("相册备份")
+                    .confirmationDialog("从服务器同步到手机相册？", isPresented: $confirmSync,
+                                        titleVisibility: .visible) {
+                        Button("开始同步") {
+                            Task { await backup.syncFromServer(address: address,
+                                password: Credentials.password(for: address), wifiOnly: wifiOnly) }
+                        }
+                        Button("取消", role: .cancel) {}
+                    } message: {
+                        Text("会遍历服务器上所有相册文件夹：手机上缺的同名相册会新建，只下载手机里没有的文件。已隐藏的相册会跳过。")
+                    }
             }.tabItem { Label("相册备份", systemImage: "photo.on.rectangle.angled") }
             NavigationStack {
                 Form {
@@ -118,6 +149,30 @@ struct ContentView: View {
             // Read remembered choices, but never start an upload on launch.
             if !backup.selected.isEmpty { await backup.loadAlbums() }
         }
+    }
+
+    private var visibleAlbums: [PhoneAlbum] {
+        backup.albums.filter { !backup.hidden.contains($0.id) }
+    }
+
+    private var hiddenAlbums: [PhoneAlbum] {
+        backup.albums.filter { backup.hidden.contains($0.id) }
+    }
+
+    @ViewBuilder
+    private func albumRow(_ album: PhoneAlbum) -> some View {
+        Button {
+            if backup.selected.contains(album.id) { backup.selected.remove(album.id) }
+            else { backup.selected.insert(album.id) }
+        } label: {
+            HStack {
+                Image(systemName: backup.selected.contains(album.id) ? "checkmark.circle.fill" : "circle")
+                Text(album.title).foregroundStyle(.primary)
+                Spacer()
+                Text("\(album.count)").foregroundStyle(.secondary)
+            }
+        }
+        .disabled(backup.running)
     }
 
     @MainActor private func connect() async {
