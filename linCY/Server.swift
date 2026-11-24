@@ -33,7 +33,7 @@ struct Server: @unchecked Sendable {
     let base: URL
     let session: URLSession
 
-    init(address: String, wifiOnly: Bool, sessionConfiguration: URLSessionConfiguration? = nil) throws {
+    init(address: String, wifiOnly: Bool) throws {
         let raw = address.trimmingCharacters(in: .whitespacesAndNewlines)
         guard var c = URLComponents(string: raw.contains("://") ? raw : "http://" + raw),
               ["http", "https"].contains(c.scheme?.lowercased() ?? ""),
@@ -44,7 +44,7 @@ struct Server: @unchecked Sendable {
         c.path = ""
         guard let url = c.url else { throw AppError.message("服务器地址无效") }
         base = url
-        let config = sessionConfiguration ?? URLSessionConfiguration.ephemeral
+        let config = URLSessionConfiguration.ephemeral
         config.allowsCellularAccess = !wifiOnly
         config.timeoutIntervalForRequest = 30
         session = URLSession(configuration: config)
@@ -52,23 +52,10 @@ struct Server: @unchecked Sendable {
 
     func request(_ path: String, query: [URLQueryItem] = [], cookie: String? = nil) -> URLRequest {
         var c = URLComponents(url: base.appendingPathComponent(path), resolvingAgainstBaseURL: false)!
-        if !query.isEmpty { c.percentEncodedQuery = Self.encodeQuery(query) }
+        if !query.isEmpty { c.queryItems = query }
         var request = URLRequest(url: c.url!)
         if let cookie { request.setValue(cookie, forHTTPHeaderField: "Cookie") }
         return request
-    }
-
-    /// URLComponents 不会编码 `+`，而服务端按表单规则解析 query 时会把 `+` 当成空格，
-    /// 导致「a+b.jpg」上传后变成「a b.jpg」，之后每次同步都判定为缺失并重传。
-    /// 这里对 query 统一手工编码，把 `+` 等子分隔符显式转义。
-    private static func encodeQuery(_ query: [URLQueryItem]) -> String {
-        var allowed = CharacterSet.urlQueryAllowed
-        allowed.remove(charactersIn: "+&=?#%")
-        return query.map { item in
-            let name = item.name.addingPercentEncoding(withAllowedCharacters: allowed) ?? item.name
-            let value = (item.value ?? "").addingPercentEncoding(withAllowedCharacters: allowed) ?? ""
-            return name + "=" + value
-        }.joined(separator: "&")
     }
 
     func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
@@ -217,7 +204,7 @@ struct Server: @unchecked Sendable {
         r.httpMethod = "POST"
         r.setValue("1", forHTTPHeaderField: "x-vuio-upload")
         r.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        r.httpBody = try JSONSerialization.data(withJSONObject: ["name": name, "path": parent, "conflict": "overwrite"])
+        r.httpBody = try JSONSerialization.data(withJSONObject: ["name": name, "parent": parent])
         let (data, _) = try await send(r)
         struct Created: Decodable { let directory: String; let skipped: Bool? }
         return try JSONDecoder().decode(Created.self, from: data).directory
@@ -231,7 +218,6 @@ struct Server: @unchecked Sendable {
         query.append(URLQueryItem(name: "conflict", value: overwrite ? "overwrite" : "skip"))
         var r = request("api/upload", query: query, cookie: cookie)
         r.httpMethod = "POST"
-        r.timeoutInterval = 3600
         r.setValue("1", forHTTPHeaderField: "x-vuio-upload")
         r.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
         r.setValue(String(size), forHTTPHeaderField: "Content-Length")
@@ -240,9 +226,20 @@ struct Server: @unchecked Sendable {
         guard (200..<300).contains(code) else {
             throw AppError.message("上传 \(name) HTTP \(code)：\(String(data: data.prefix(200), encoding: .utf8) ?? "")")
         }
-        struct Receipt: Decodable { let name: String; let size: Int64?; let skipped: Bool? }
-        let receipt = try JSONDecoder().decode(Receipt.self, from: data)
-        guard receipt.name == name, receipt.size == size || (!overwrite && receipt.skipped == true) else { throw AppError.message("上传回执大小不符：\(name)") }
     }
 
+    /// POST /api/upload-delete?path= — 删除备份根下的文件或文件夹。
+    /// 返回 false 表示服务端还没有这个接口（旧版本），调用方应跳过删除而不是报错。
+    func deleteUpload(path: String, cookie: String) async throws -> Bool {
+        var r = request("api/upload-delete", query: [URLQueryItem(name: "path", value: path)], cookie: cookie)
+        r.httpMethod = "POST"
+        r.setValue("1", forHTTPHeaderField: "x-vuio-delete")
+        let (data, response) = try await session.data(for: r)
+        let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+        if code == 404 { return false }
+        guard (200..<300).contains(code) else {
+            throw AppError.message("删除 \(path) HTTP \(code)：\(String(data: data.prefix(200), encoding: .utf8) ?? "")")
+        }
+        return true
+    }
 }

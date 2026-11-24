@@ -72,6 +72,33 @@ enum PhotoLibrary {
         return stem + suffix + (original.pathExtension.isEmpty ? "" : "." + ext)
     }
 
+    /// 上传和下载查重必须使用同一份资源清单及重名规则。
+    struct BackupEntry {
+        let resource: PHAssetResource
+        let name: String
+    }
+
+    static func backupEntries(in collection: PHAssetCollection) -> [BackupEntry] {
+        let assets = PHAsset.fetchAssets(in: collection, options: options())
+        var counts: [String: Int] = [:]
+        assets.enumerateObjects { asset, _, _ in
+            for resource in resources(asset) {
+                let name = resourceName(resource, asset: asset, duplicated: false)
+                counts[name.lowercased(), default: 0] += 1
+            }
+        }
+        var entries: [BackupEntry] = []
+        assets.enumerateObjects { asset, _, _ in
+            for resource in resources(asset) {
+                let plain = resourceName(resource, asset: asset, duplicated: false)
+                entries.append(BackupEntry(resource: resource,
+                    name: resourceName(resource, asset: asset,
+                        duplicated: (counts[plain.lowercased()] ?? 0) > 1)))
+            }
+        }
+        return entries
+    }
+
     static func export(_ resource: PHAssetResource, to url: URL) async throws {
         let options = PHAssetResourceRequestOptions()
         options.isNetworkAccessAllowed = true
@@ -84,19 +111,11 @@ enum PhotoLibrary {
 
     // MARK: - 反向同步：服务器 → 手机相册
 
-    /// 相册内已有文件的原始文件名集合（小写），用于和服务器对比。
-    /// 上传统一用 originalFilename 命名，所以两端能对得上。
+    /// 包含动图、实况照片的全部备份资源，并沿用上传的安全命名和重名后缀。
     static func existingFilenames(in collection: PHAssetCollection) async -> Set<String> {
         await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
-                let assets = PHAsset.fetchAssets(in: collection, options: nil)
-                var names = Set<String>()
-                names.reserveCapacity(assets.count)
-                assets.enumerateObjects { asset, _, _ in
-                    if let resource = PHAssetResource.assetResources(for: asset).first {
-                        names.insert(resource.originalFilename.lowercased())
-                    }
-                }
+                let names = Set(backupEntries(in: collection).map { $0.name.lowercased() })
                 continuation.resume(returning: names)
             }
         }
@@ -133,11 +152,13 @@ enum PhotoLibrary {
     }
 
     /// 把下载好的临时文件存进指定相册。文件会被 PhotoKit 移走，调用方无需再删。
-    static func saveDownloaded(fileURL: URL, kind: String, into collection: PHAssetCollection) async throws {
+    static func saveDownloaded(fileURL: URL, originalFilename: String, kind: String, into collection: PHAssetCollection) async throws {
         let type: PHAssetResourceType = (kind == "video") ? .video : .photo
         try await PHPhotoLibrary.shared().performChanges {
             let request = PHAssetCreationRequest.forAsset()
             let options = PHAssetResourceCreationOptions()
+            // 中转路径带 UUID，仅用于防止缓存冲突，不能成为相册中的文件名。
+            options.originalFilename = originalFilename
             options.shouldMoveFile = true
             request.addResource(with: type, fileURL: fileURL, options: options)
             if let albumChange = PHAssetCollectionChangeRequest(for: collection),

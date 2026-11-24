@@ -40,7 +40,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions:
         [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
         _ = BackupManager.shared
-        _ = FolderSyncManager.shared
+        _ = FolderBackupManager.shared
         return true
     }
     func application(_ application: UIApplication, handleEventsForBackgroundURLSession identifier: String,
@@ -75,7 +75,6 @@ struct ContentView: View {
         TabView {
             webTab
             albumTab
-            FolderSyncView(currentAddress: address, wifiOnly: wifiOnly)
             connectionTab
         }
         .task { await restore() }

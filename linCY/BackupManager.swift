@@ -92,7 +92,6 @@ final class BackupManager: NSObject, ObservableObject, URLSessionDataDelegate {
     }
 
     @MainActor func start(address: String, password: String, wifiOnly: Bool) async {
-        guard !FolderSyncManager.shared.running, FolderSyncManager.shared.preview == nil else { status = "请先完成当前文件夹同步"; return }
         guard !running, !restoring else { return }
         let chosen = albums.filter { selected.contains($0.id) }
         guard !chosen.isEmpty else { status = "请先选择至少一个相册"; return }
@@ -120,29 +119,7 @@ final class BackupManager: NSObject, ObservableObject, URLSessionDataDelegate {
                 status = "正在对比相册：\(album.title)"
                 folder = try await server.ensureAlbum(folder, known: &known, cookie: cookie)
                 log("相册 \(album.title) → 服务器 /\(folder)")
-                let assets = PHAsset.fetchAssets(in: album.collection, options: PhotoLibrary.options())
-
-                // 第一步：本地汇总本相册的全部文件，纯内存操作，不产生网络请求。
-                // 同名资源需要加短 ID 后缀区分，先统计一次重名情况。
-                var counts: [String: Int] = [:]
-                assets.enumerateObjects { asset, _, _ in
-                    for resource in PhotoLibrary.resources(asset) {
-                        let name = PhotoLibrary.resourceName(resource, asset: asset, duplicated: false).lowercased()
-                        counts[name, default: 0] += 1
-                    }
-                }
-
-                struct Entry { let resource: PHAssetResource; let name: String }
-                var entries: [Entry] = []
-                entries.reserveCapacity(assets.count)
-                assets.enumerateObjects { asset, _, _ in
-                    for resource in PhotoLibrary.resources(asset) {
-                        let plain = PhotoLibrary.resourceName(resource, asset: asset, duplicated: false)
-                        let name = PhotoLibrary.resourceName(resource, asset: asset,
-                            duplicated: (counts[plain.lowercased()] ?? 0) > 1)
-                        entries.append(Entry(resource: resource, name: name))
-                    }
-                }
+                let entries = PhotoLibrary.backupEntries(in: album.collection)
 
                 // 第二步：并发查重。原来是每个文件一次串行 exists，往返次数等于文件数；
                 // 现在按固定窗口并发，往返次数降到 1/parallel。
@@ -214,7 +191,6 @@ final class BackupManager: NSObject, ObservableObject, URLSessionDataDelegate {
     /// 把服务器上的指定相册同步到手机同名相册：不存在就新建，
     /// 只下载手机里没有的文件（按原始文件名比对，和上传用的是同一套命名）。
     @MainActor func syncAlbums(_ names: [String], address: String, password: String, wifiOnly: Bool) async {
-        guard !FolderSyncManager.shared.running, FolderSyncManager.shared.preview == nil else { status = "请先完成当前文件夹同步"; return }
         guard !running, !restoring, !names.isEmpty else { return }
         running = true
         stopRequested = false
@@ -271,7 +247,8 @@ final class BackupManager: NSObject, ObservableObject, URLSessionDataDelegate {
                     do {
                         try await server.downloadPhoto(album: remoteName, name: item.name,
                             cookie: cookie, to: target)
-                        try await PhotoLibrary.saveDownloaded(fileURL: target, kind: item.kind, into: collection)
+                        try await PhotoLibrary.saveDownloaded(fileURL: target, originalFilename: item.name,
+                            kind: item.kind, into: collection)
                         downloaded += 1
                         log("已同步：\(item.name)")
                     } catch {
@@ -526,3 +503,241 @@ struct WatchedFolder: Codable, Identifiable, Equatable {
     var bookmark: Data
 }
 
+/// 以手机文件夹为准镜像到服务器备份根下的同名文件夹：
+/// 缺失或大小变动的上传，服务器上比手机多的删除。可同时维护多个文件夹。
+final class FolderBackupManager: ObservableObject {
+    static let shared = FolderBackupManager()
+
+    @Published var folders: [WatchedFolder] = [] {
+        didSet { persist() }
+    }
+    @Published var running = false
+    @Published var status = "添加手机文件夹后开始同步"
+    @Published var logs: [String] = []
+    @Published var uploaded = 0
+    @Published var skipped = 0
+    @Published var deleted = 0
+    @Published var failed = 0
+    @Published var progress: Double = 0
+    /// 服务端没有 /api/upload-delete 时置位并持久化，之后不再尝试删除，只做增量上传。
+    @Published var deletionUnavailable: Bool = UserDefaults.standard.bool(forKey: "folderDeletionUnavailable") {
+        didSet { UserDefaults.standard.set(deletionUnavailable, forKey: "folderDeletionUnavailable") }
+    }
+
+    private let storeKey = "watchedFolders"
+    private let fileManager = FileManager.default
+
+    private init() { load() }
+
+    func log(_ text: String) {
+        logs.insert(text, at: 0)
+        if logs.count > 200 { logs.removeLast() }
+    }
+
+    // MARK: 列表维护
+
+    @discardableResult
+    func addFolder(_ url: URL) -> Bool {
+        let accessing = url.startAccessingSecurityScopedResource()
+        defer { if accessing { url.stopAccessingSecurityScopedResource() } }
+        do {
+            let data = try url.bookmarkData(options: [], includingResourceValuesForKeys: nil,
+                                            relativeTo: nil)
+            let name = url.lastPathComponent
+            guard !folders.contains(where: { $0.displayName == name }) else {
+                status = "「\(name)」已在列表里"
+                return false
+            }
+            folders.append(WatchedFolder(id: UUID(), displayName: name, bookmark: data))
+            status = "已添加：\(name)"
+            return true
+        } catch {
+            status = "添加失败：\(error.localizedDescription)"
+            log(status)
+            return false
+        }
+    }
+
+    func remove(_ id: UUID) {
+        folders.removeAll { $0.id == id }
+    }
+
+    private func persist() {
+        guard let data = try? JSONEncoder().encode(folders) else { return }
+        UserDefaults.standard.set(data, forKey: storeKey)
+    }
+
+    private func load() {
+        guard let data = UserDefaults.standard.data(forKey: storeKey),
+              let saved = try? JSONDecoder().decode([WatchedFolder].self, from: data) else { return }
+        folders = saved
+    }
+
+    // MARK: 同步
+
+    @MainActor func startSync(address: String, password: String, wifiOnly: Bool) async {
+        guard !running else { return }
+        guard !folders.isEmpty else { status = "请先添加手机文件夹"; return }
+        running = true
+        uploaded = 0; skipped = 0; deleted = 0; failed = 0; progress = 0
+        defer { running = false; progress = 0 }
+
+        do {
+            let server = try Server(address: address, wifiOnly: wifiOnly)
+            let cookie = try await server.login(password: password)
+            var deletionBlocked = false
+
+            var index = 0
+            for folder in folders {
+                index += 1
+                status = "同步 \(index)/\(folders.count)：\(folder.displayName)"
+                do {
+                    try await syncOne(folder, server: server, cookie: cookie)
+                } catch {
+                    failed += 1
+                    log("失败 \(folder.displayName)：\(error.localizedDescription)")
+                }
+                progress = Double(index) / Double(folders.count)
+            }
+
+            var summary = "完成：上传 \(uploaded) · 跳过 \(skipped) · 失败 \(failed)"
+            if !deletionUnavailable { summary += " · 删除 \(deleted)" }
+            status = summary
+            if deletionUnavailable {
+                log("服务端没有删除接口，只同步新增与变动的文件（不会删除服务器已有内容）")
+            }
+        } catch {
+            status = "同步中止：\(error.localizedDescription)"
+            log(status)
+        }
+    }
+
+    /// 同步单个文件夹。服务端不支持删除时只做增量上传。
+    @MainActor
+    private func syncOne(_ folder: WatchedFolder, server: Server, cookie: String) async throws {
+        var stale = false
+        let root = try URL(resolvingBookmarkData: folder.bookmark, options: [],
+                           relativeTo: nil, bookmarkDataIsStale: &stale)
+        guard root.startAccessingSecurityScopedResource() else {
+            throw AppError.message("无法访问「\(folder.displayName)」，请重新添加该文件夹")
+        }
+        defer { root.stopAccessingSecurityScopedResource() }
+
+        let local = try scanLocal(root: root)
+        log("\(folder.displayName)：本地 \(local.count) 个文件")
+        guard !local.isEmpty else {
+            log("\(folder.displayName)：文件夹为空，跳过")
+            return
+        }
+
+        // 远端根目录：不存在就新建（服务端会自动处理同名冲突）
+        let wanted = PhotoLibrary.safeName(folder.displayName)
+        let top = try await server.uploadContents(path: "", cookie: cookie)
+        let remoteRoot: String
+        if let existing = top.entries.first(where: { $0.name == wanted && $0.isDir }) {
+            remoteRoot = existing.name
+        } else {
+            remoteRoot = try await server.createFolder(name: wanted, parent: "", cookie: cookie)
+            log("新建服务器文件夹 /\(remoteRoot)")
+        }
+
+        let remote = try await scanRemote(server: server, root: remoteRoot, cookie: cookie)
+        log("\(folder.displayName)：服务器已有 \(remote.count) 个条目")
+
+        // 上传缺失的、或大小对不上的
+        for item in local {
+            let remoteDir = item.dirRelative.isEmpty ? remoteRoot : remoteRoot + "/" + item.dirRelative
+            let remotePath = remoteRoot + "/" + item.relative
+            if let existing = remote[remotePath], !existing.isDir,
+               let size = existing.size, size == item.size {
+                skipped += 1
+                continue
+            }
+            do {
+                try await server.uploadFile(path: remoteDir, name: item.name, fileURL: item.url,
+                                            size: item.size, overwrite: true, cookie: cookie)
+                uploaded += 1
+                log("上传 \(item.relative)")
+            } catch {
+                failed += 1
+                log("失败 \(item.relative)：\(error.localizedDescription)")
+                if error is URLError || error.localizedDescription.contains("HTTP 401") { throw error }
+            }
+        }
+
+        // 服务端没有删除接口时跳过清理，只保留增量上传
+        guard !deletionUnavailable else { return }
+
+        let localPaths = Set(local.map { remoteRoot + "/" + $0.relative })
+        let extras = remote.filter { !localPaths.contains($0.key) }
+            .sorted { $0.key.count > $1.key.count }
+        for (path, _) in extras {
+            do {
+                if try await server.deleteUpload(path: path, cookie: cookie) {
+                    deleted += 1
+                    log("删除 \(path)")
+                } else {
+                    deletionUnavailable = true
+                    log("服务端没有删除接口：本轮起只做增量同步，不再清理服务器文件")
+                    return
+                }
+            } catch {
+                failed += 1
+                log("删除失败 \(path)：\(error.localizedDescription)")
+            }
+        }
+    }
+
+    struct LocalItem {
+        let url: URL
+        let relative: String
+        let dirRelative: String
+        let name: String
+        let size: Int64
+    }
+
+    private func scanLocal(root: URL) throws -> [LocalItem] {
+        let keys: [URLResourceKey] = [.isDirectoryKey, .isRegularFileKey, .fileSizeKey]
+        guard let en = fileManager.enumerator(
+            at: root,
+            includingPropertiesForKeys: keys,
+            options: [.skipsHiddenFiles, .skipsPackageDescendants]) else { return [] }
+
+        let base = root.standardizedFileURL.path
+        var items: [LocalItem] = []
+        for case let url as URL in en {
+            let values = try? url.resourceValues(forKeys: Set(keys))
+            guard values?.isRegularFile == true else { continue }
+            let path = url.standardizedFileURL.path
+            guard path.hasPrefix(base) else { continue }
+            var relative = String(path.dropFirst(base.count))
+            if relative.hasPrefix("/") { relative.removeFirst() }
+            guard !relative.isEmpty else { continue }
+            items.append(LocalItem(
+                url: url,
+                relative: relative,
+                dirRelative: (relative as NSString).deletingLastPathComponent,
+                name: url.lastPathComponent,
+                size: Int64(values?.fileSize ?? 0)))
+        }
+        return items
+    }
+
+    private func scanRemote(server: Server, root: String,
+                            cookie: String) async throws -> [String: Server.UploadEntry] {
+        var result: [String: Server.UploadEntry] = [:]
+        var queue: [String] = [root]
+        var visited = 0
+        while let dir = queue.popLast() {
+            visited += 1
+            if visited > 5000 { throw AppError.message("服务器目录过多，已中止") }
+            let contents = try await server.uploadContents(path: dir, cookie: cookie)
+            for entry in contents.entries {
+                let relative = dir.isEmpty ? entry.name : "\(dir)/\(entry.name)"
+                result[relative] = entry
+                if entry.isDir { queue.append(relative) }
+            }
+        }
+        return result
+    }
+}
