@@ -114,6 +114,7 @@ struct ContentView: View {
         NavigationStack {
             List {
                 summarySection
+                conflictsSection
                 sourceSection
                 if albumSource == .local {
                     localAlbumsSection
@@ -299,6 +300,67 @@ struct ContentView: View {
                   systemImage: "arrow.down.circle.fill")
         }
         .disabled(backup.running || backup.restoring)
+    }
+
+    /// 同名不同大小检查：手动触发，逐张导出比对，只读不改。
+    @ViewBuilder
+    private var conflictsSection: some View {
+        Section {
+            Button {
+                Task { await scanConflicts() }
+            } label: {
+                Label(backup.scanning ? "正在检查…" : "检查同名不同大小",
+                      systemImage: "checkmark.seal")
+            }
+            .disabled(backup.running || backup.scanning || backup.restoring || backup.selected.isEmpty)
+
+            if backup.scanning {
+                ProgressView(value: backup.scanProgress)
+                Button("停止检查") { backup.stop() }
+            }
+
+            ForEach(backup.conflicts) { item in
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(item.name)
+                        .font(.footnote)
+                        .lineLimit(1)
+                        .textSelection(.enabled)
+                    Text("\(item.album) · 本地 \(sizeText(item.localSize)) / 服务器 \(sizeText(item.remoteSize))")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            if !backup.conflicts.isEmpty {
+                Button {
+                    UIPasteboard.general.string = conflictReport
+                } label: {
+                    Label("复制清单（\(backup.conflicts.count) 条）", systemImage: "doc.on.doc")
+                }
+            }
+        } header: {
+            Text(backup.conflicts.isEmpty ? "同名未覆盖" : "同名未覆盖（\(backup.conflicts.count)）")
+        } footer: {
+            Text("检查会把勾选相册里服务器已有的文件逐张导出比对大小，比较慢、可随时停止，不修改任何文件。列出的文件在备份时按同名跳过、不会覆盖；需要更新时请先在服务器上删除对应文件。")
+        }
+    }
+
+    private var conflictReport: String {
+        backup.conflicts
+            .map { "\($0.album)\t\($0.name)\t\($0.localSize)\t\($0.remoteSize)" }
+            .joined(separator: "\n")
+    }
+
+    private func sizeText(_ bytes: Int64) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        return formatter.string(fromByteCount: bytes)
+    }
+
+    @MainActor
+    private func scanConflicts() async {
+        await backup.scanConflicts(address: address,
+            password: Credentials.password(for: address), wifiOnly: wifiOnly)
     }
 
     @ViewBuilder

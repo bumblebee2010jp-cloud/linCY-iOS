@@ -185,7 +185,7 @@ struct Server: @unchecked Sendable {
 
     struct UploadEntry: Decodable {
         let name: String
-        let path: String
+        let path: String?
         let isDir: Bool
         /// 旧版服务端不返回 size；缺失时按 0 处理，只会导致多传一次。
         let size: Int64?
@@ -194,6 +194,26 @@ struct Server: @unchecked Sendable {
             case name, path, size
             case isDir = "is_dir"
         }
+    }
+
+    /// 服务器某个相册目录的清单：全部文件名 + 已知字节数。
+    struct RemoteIndex {
+        let names: Set<String>
+        let sizes: [String: Int64]
+        /// 服务端一个大小都没返回时（旧版），这里为 false，调用方跳过大小比对。
+        var hasSizes: Bool { !sizes.isEmpty }
+    }
+
+    /// GET /api/upload-contents?path=<相册> — 一次拿回目录内全部文件名与字节数。
+    func remoteIndex(album: String, cookie: String) async throws -> RemoteIndex {
+        let contents = try await uploadContents(path: album, cookie: cookie)
+        var names = Set<String>()
+        var sizes: [String: Int64] = [:]
+        for entry in contents.entries where !entry.isDir {
+            names.insert(entry.name)
+            if let size = entry.size { sizes[entry.name] = size }
+        }
+        return RemoteIndex(names: names, sizes: sizes)
     }
 
     struct UploadContents: Decodable {

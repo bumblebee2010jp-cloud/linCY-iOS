@@ -2,6 +2,15 @@ import UIKit
 import Photos
 import SwiftUI
 
+/// 服务器上已存在同名文件但字节数不同时的记录（只读检查结果，不参与上传）。
+struct BackupConflict: Identifiable, Equatable {
+    let id = UUID()
+    let album: String
+    let name: String
+    let localSize: Int64
+    let remoteSize: Int64
+}
+
 // Main-thread state; URLSession delegates are delivered on OperationQueue.main.
 final class BackupManager: NSObject, ObservableObject, URLSessionDataDelegate {
     static let shared = BackupManager()
@@ -26,6 +35,10 @@ final class BackupManager: NSObject, ObservableObject, URLSessionDataDelegate {
     @Published var failed = 0
     @Published var downloaded = 0
     @Published var progress: Double = 0
+    /// 手动「检查同名不同大小」的结果与状态。
+    @Published var conflicts: [BackupConflict] = []
+    @Published var scanning = false
+    @Published var scanProgress: Double = 0
     var backgroundCompletion: (() -> Void)?
     private var session: URLSession!
     private var uploadContinuation: CheckedContinuation<Bool, Error>?
@@ -176,6 +189,106 @@ final class BackupManager: NSObject, ObservableObject, URLSessionDataDelegate {
             status = "已停止；下次点击开始备份会重新对比并补传"
         } catch {
             status = "本轮中止：\(error.localizedDescription)。修复后点击开始备份重试"
+            log(status)
+        }
+    }
+
+    // MARK: - 同名不同大小检查（只读，不改动任何文件）
+
+    /// 逐张把「服务器已存在」的文件导出到临时目录取字节数，再与服务端返回的大小比对。
+    /// 只走公开 API（PHAssetResourceManager 导出 + FileManager 读属性），与上传路径完全一致，
+    /// 不读任何私有属性、不覆盖、不删除服务器内容。
+    /// 代价是每张已存在文件都要导出一次，因此做成手动触发，显示进度，可随时停止。
+    @MainActor func scanConflicts(address: String, password: String, wifiOnly: Bool) async {
+        guard !running, !scanning, !restoring else { return }
+        let chosen = albums.filter { selected.contains($0.id) }
+        guard !chosen.isEmpty else { status = "先勾选要检查的相册"; return }
+
+        scanning = true
+        stopRequested = false
+        conflicts.removeAll()
+        scanProgress = 0
+        defer {
+            scanning = false
+            scanProgress = 0
+        }
+
+        do {
+            let server = try Server(address: address, wifiOnly: wifiOnly)
+            let cookie = try await server.login(password: password)
+            let titleCounts = Dictionary(grouping: albums, by: { PhotoLibrary.safeName($0.title).lowercased() })
+            let known = Set(try await server.albums(cookie: cookie))
+
+            var plans: [(album: PhoneAlbum, folder: String, entries: [PhotoLibrary.BackupEntry])] = []
+            var total = 0
+            for album in chosen {
+                var folder = PhotoLibrary.safeName(album.title)
+                if (titleCounts[folder.lowercased()]?.count ?? 0) > 1 {
+                    folder += "_" + PhotoLibrary.shortID(album.id)
+                }
+                guard known.contains(folder) else {
+                    log("\(album.title)：服务器上没有对应文件夹，跳过")
+                    continue
+                }
+                let entries = PhotoLibrary.backupEntries(in: album.collection)
+                plans.append((album, folder, entries))
+                total += entries.count
+            }
+            guard total > 0 else {
+                status = "所选相册没有可检查的文件"
+                return
+            }
+
+            var done = 0
+            for plan in plans {
+                try checkStop()
+                status = "读取服务器清单：\(plan.album.title)"
+                let index: Server.RemoteIndex
+                do {
+                    index = try await server.remoteIndex(album: plan.folder, cookie: cookie)
+                } catch {
+                    log("\(plan.album.title)：读取服务器清单失败 \(error.localizedDescription)")
+                    done += plan.entries.count
+                    continue
+                }
+                guard index.hasSizes else {
+                    log("\(plan.album.title)：服务端未返回文件大小，无法比对（需要新版服务端）")
+                    done += plan.entries.count
+                    continue
+                }
+
+                for entry in plan.entries {
+                    try checkStop()
+                    done += 1
+                    scanProgress = Double(done) / Double(total)
+                    guard index.names.contains(entry.name),
+                          let remoteSize = index.sizes[entry.name] else { continue }
+                    status = "比对 \(plan.album.title)：\(entry.name)（\(done)/\(total)）"
+                    let temp = try exportURL()
+                    defer { try? fileManager.removeItem(at: temp) }
+                    do {
+                        try await PhotoLibrary.export(entry.resource, to: temp)
+                        let attrs = try fileManager.attributesOfItem(atPath: temp.path)
+                        let localSize = (attrs[.size] as? NSNumber)?.int64Value ?? 0
+                        if localSize != remoteSize {
+                            conflicts.append(BackupConflict(album: plan.folder, name: entry.name,
+                                localSize: localSize, remoteSize: remoteSize))
+                            log("同名不同大小：\(plan.folder)/\(entry.name)")
+                        }
+                    } catch {
+                        log("比对失败 \(entry.name)：\(error.localizedDescription)")
+                    }
+                }
+            }
+
+            status = conflicts.isEmpty
+                ? "检查完成：没有同名不同大小的文件"
+                : "检查完成：发现 \(conflicts.count) 个同名未覆盖"
+            log(status)
+        } catch is CancellationError {
+            status = "已停止检查；已比对的结果保留"
+        } catch {
+            status = "检查中止：\(error.localizedDescription)"
             log(status)
         }
     }
