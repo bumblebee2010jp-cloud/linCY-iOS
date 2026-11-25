@@ -84,8 +84,11 @@ struct Server: @unchecked Sendable {
         return "\(cookie.name)=\(cookie.value)"
     }
 
-    func albums(cookie: String) async throws -> [String] {
-        let (data, _) = try await send(request("api/albums", cookie: cookie))
+    func albums(cookie: String, preservingDates: Bool = false) async throws -> [String] {
+        let (data, response) = try await send(request("api/albums", cookie: cookie))
+        if preservingDates && response.value(forHTTPHeaderField: "x-lincy-photo-dates") != "1" {
+            throw AppError.message("请先更新 Windows 服务端：当前服务端不能保存手机相册原有时间")
+        }
         return try JSONDecoder().decode([String].self, from: data)
     }
 
@@ -117,13 +120,15 @@ struct Server: @unchecked Sendable {
         return check.exists
     }
 
-    func uploadRequest(album: String, name: String, cookie: String, size: Int64) -> URLRequest {
+    func uploadRequest(album: String, name: String, cookie: String, size: Int64, creationDate: Date) -> URLRequest {
         var r = request("api/upload", query: [URLQueryItem(name: "album", value: album),
             URLQueryItem(name: "name", value: name), URLQueryItem(name: "conflict", value: "skip")], cookie: cookie)
         r.httpMethod = "POST"
         r.setValue("1", forHTTPHeaderField: "x-vuio-upload")
         r.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
         r.setValue(String(size), forHTTPHeaderField: "Content-Length")
+        let milliseconds = Int64((creationDate.timeIntervalSince1970 * 1000).rounded())
+        r.setValue(String(milliseconds), forHTTPHeaderField: "x-lincy-creation-date-ms")
         return r
     }
 
@@ -154,7 +159,7 @@ struct Server: @unchecked Sendable {
     }
 
     /// GET /api/album/photo?album=&name= — 下载原始文件到指定位置。
-    func downloadPhoto(album: String, name: String, cookie: String, to destination: URL) async throws {
+    func downloadPhoto(album: String, name: String, cookie: String, to destination: URL) async throws -> Date? {
         let req = request("api/album/photo", query: [
             URLQueryItem(name: "album", value: album),
             URLQueryItem(name: "name", value: name)
@@ -167,6 +172,13 @@ struct Server: @unchecked Sendable {
         }
         try? FileManager.default.removeItem(at: destination)
         try FileManager.default.moveItem(at: temp, to: destination)
+        guard let value = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "x-lincy-creation-date-ms"),
+              let milliseconds = Int64(value) else { return nil }
+        let seconds = Double(milliseconds) / 1000
+        guard seconds >= -2208988800, seconds <= Date().timeIntervalSince1970 + 86400 else {
+            throw AppError.message("服务器返回的原相册时间无效")
+        }
+        return Date(timeIntervalSince1970: seconds)
     }
 
     // MARK: - 备份根目录（upload）操作，供文件夹镜像同步

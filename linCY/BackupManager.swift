@@ -108,7 +108,7 @@ final class BackupManager: NSObject, ObservableObject, URLSessionDataDelegate {
         do {
             let server = try Server(address: address, wifiOnly: wifiOnly)
             let cookie = try await server.login(password: password)
-            var known = Set(try await server.albums(cookie: cookie))
+            var known = Set(try await server.albums(cookie: cookie, preservingDates: true))
             let titleCounts = Dictionary(grouping: albums, by: { PhotoLibrary.safeName($0.title).lowercased() })
             for album in chosen {
                 try checkStop()
@@ -134,7 +134,11 @@ final class BackupManager: NSObject, ObservableObject, URLSessionDataDelegate {
                 // 第三步：只上传缺失文件。上传仍逐个串行（后台 URLSession 单任务模型）。
                 for entry in entries {
                     try checkStop()
-                    if existing.contains(entry.name) { continue }
+                    if existing.contains(entry.name) {
+                        PhotoLibrary.rememberDate(entry.creationDate, server: server.base,
+                            album: folder, name: entry.name)
+                        continue
+                    }
                     let name = entry.name
                     do {
                         status = "正在备份 \(album.title)：\(name)"
@@ -147,8 +151,14 @@ final class BackupManager: NSObject, ObservableObject, URLSessionDataDelegate {
                         guard size <= 20 * 1024 * 1024 * 1024 else {
                             throw AppError.message("单个文件超过服务器 20 GiB 限制")
                         }
-                        let request = server.uploadRequest(album: folder, name: name, cookie: cookie, size: size)
+                        guard let creationDate = entry.creationDate else {
+                            throw AppError.message("无法读取手机相册原有时间，已跳过上传以免丢失时间")
+                        }
+                        let request = server.uploadRequest(album: folder, name: name, cookie: cookie,
+                            size: size, creationDate: creationDate)
                         let wasSkipped = try await upload(request, file: temp, name: name, wifiOnly: wifiOnly)
+                        PhotoLibrary.rememberDate(entry.creationDate, server: server.base,
+                            album: folder, name: entry.name)
                         if wasSkipped { skipped += 1 } else { uploaded += 1 }
                         log(wasSkipped ? "服务器已有：\(name)" : "已备份：\(name)")
                     } catch {
@@ -245,10 +255,12 @@ final class BackupManager: NSObject, ObservableObject, URLSessionDataDelegate {
                     status = "下载 \(remoteName)：\(item.name)"
                     let target = staging.appendingPathComponent(UUID().uuidString + "-" + item.name)
                     do {
-                        try await server.downloadPhoto(album: remoteName, name: item.name,
+                        let originalDate = try await server.downloadPhoto(album: remoteName, name: item.name,
                             cookie: cookie, to: target)
                         try await PhotoLibrary.saveDownloaded(fileURL: target, originalFilename: item.name,
-                            kind: item.kind, into: collection)
+                            kind: item.kind,
+                            creationDate: originalDate ?? PhotoLibrary.rememberedDate(server: server.base,
+                                album: remoteName, name: item.name), into: collection)
                         downloaded += 1
                         log("已同步：\(item.name)")
                     } catch {
@@ -464,10 +476,14 @@ final class BackupManager: NSObject, ObservableObject, URLSessionDataDelegate {
         if let error { result = .failure(error) }
         else if let response = task.response as? HTTPURLResponse,
                 (200..<300).contains(response.statusCode) {
-            // 2xx 即表示服务器已接收该文件。响应体只用来识别「服务器已存在此文件」，
-            // 缺字段或空 body（例如 201 且无返回内容）不应判为失败。
             let json = (try? JSONSerialization.jsonObject(with: responseBody)) as? [String: Any]
-            result = .success(json?["skipped"] as? Bool == true)
+            let skipped = json?["skipped"] as? Bool == true
+            if !skipped,
+               let sent = (task.originalRequest ?? task.currentRequest)?.value(forHTTPHeaderField: "x-lincy-creation-date-ms"),
+               let expected = Int64(sent),
+               (json?["creation_date_ms"] as? NSNumber)?.int64Value != expected {
+                result = .failure(AppError.message("文件已接收，但服务端未确认保存原相册时间；请检查 Windows 服务端版本"))
+            } else { result = .success(skipped) }
         } else {
             let code = (task.response as? HTTPURLResponse)?.statusCode ?? 0
             let body = String(data: responseBody.prefix(300), encoding: .utf8) ?? ""

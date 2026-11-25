@@ -1,6 +1,8 @@
 import Photos
 import CryptoKit
 import Foundation
+import ImageIO
+import AVFoundation
 
 struct PhoneAlbum: Identifiable {
     let id: String
@@ -76,6 +78,7 @@ enum PhotoLibrary {
     struct BackupEntry {
         let resource: PHAssetResource
         let name: String
+        let creationDate: Date?
     }
 
     static func backupEntries(in collection: PHAssetCollection) -> [BackupEntry] {
@@ -93,7 +96,8 @@ enum PhotoLibrary {
                 let plain = resourceName(resource, asset: asset, duplicated: false)
                 entries.append(BackupEntry(resource: resource,
                     name: resourceName(resource, asset: asset,
-                        duplicated: (counts[plain.lowercased()] ?? 0) > 1)))
+                        duplicated: (counts[plain.lowercased()] ?? 0) > 1),
+                    creationDate: asset.creationDate))
             }
         }
         return entries
@@ -151,11 +155,77 @@ enum PhotoLibrary {
         return created
     }
 
+    // 只记录本机已知的相册日期；按服务器、远端相册、完整文件名隔离。
+    // 不把下载时间、HTTP Last-Modified 或缓存文件创建时间当成拍摄时间。
+    static func dateKey(server: URL, album: String, name: String) -> String {
+        let identity = [server.absoluteString, album, name]
+        let data = try! JSONEncoder().encode(identity)
+        return "captureDate." + SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func rememberDate(_ date: Date?, server: URL, album: String, name: String) {
+        guard let date else { return }
+        UserDefaults.standard.set(date, forKey: dateKey(server: server, album: album, name: name))
+    }
+
+    static func rememberedDate(server: URL, album: String, name: String) -> Date? {
+        UserDefaults.standard.object(forKey: dateKey(server: server, album: album, name: name)) as? Date
+    }
+
+    static func embeddedCreationDate(fileURL: URL, kind: String) async -> Date? {
+        if kind == "video" {
+            let asset = AVURLAsset(url: fileURL)
+            if let item = try? await asset.load(.creationDate) {
+                if let date = try? await item.load(.dateValue) { return date }
+                if let value = try? await item.load(.stringValue) {
+                    let formatter = ISO8601DateFormatter()
+                    if let date = formatter.date(from: value) { return date }
+                    formatter.formatOptions.insert(.withFractionalSeconds)
+                    return formatter.date(from: value)
+                }
+            }
+            return nil
+        }
+        guard let source = CGImageSourceCreateWithURL(fileURL as CFURL, nil),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any]
+        else { return nil }
+        let exif = properties[kCGImagePropertyExifDictionary as String] as? [String: Any]
+        let tiff = properties[kCGImagePropertyTIFFDictionary as String] as? [String: Any]
+        let values = [
+            (exif?[kCGImagePropertyExifDateTimeOriginal as String] as? String,
+             exif?["OffsetTimeOriginal"] as? String),
+            (exif?[kCGImagePropertyExifDateTimeDigitized as String] as? String,
+             exif?["OffsetTimeDigitized"] as? String),
+            (tiff?[kCGImagePropertyTIFFDateTime as String] as? String, nil)
+        ]
+        for (value, offset) in values {
+            guard let value else { continue }
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.isLenient = false
+            if let offset {
+                formatter.dateFormat = "yyyy:MM:dd HH:mm:ssXXXXX"
+                if let date = formatter.date(from: value + offset) { return date }
+            } else {
+                // EXIF 没有时区时沿用本机时区，不能假定为 UTC 造成八小时偏移。
+                formatter.timeZone = .current
+                formatter.dateFormat = "yyyy:MM:dd HH:mm:ss"
+                if let date = formatter.date(from: value) { return date }
+            }
+        }
+        return nil
+    }
+
     /// 把下载好的临时文件存进指定相册。文件会被 PhotoKit 移走，调用方无需再删。
-    static func saveDownloaded(fileURL: URL, originalFilename: String, kind: String, into collection: PHAssetCollection) async throws {
+    static func saveDownloaded(fileURL: URL, originalFilename: String, kind: String, creationDate: Date?, into collection: PHAssetCollection) async throws {
+        let embeddedDate = await embeddedCreationDate(fileURL: fileURL, kind: kind)
+        guard let captureDate = creationDate ?? embeddedDate else {
+            throw AppError.message("无法确定原拍摄时间，已跳过保存以免变成下载时间；如本机仍有原件，请先备份一次以记录日期")
+        }
         let type: PHAssetResourceType = (kind == "video") ? .video : .photo
         try await PHPhotoLibrary.shared().performChanges {
             let request = PHAssetCreationRequest.forAsset()
+            request.creationDate = captureDate
             let options = PHAssetResourceCreationOptions()
             // 中转路径带 UUID，仅用于防止缓存冲突，不能成为相册中的文件名。
             options.originalFilename = originalFilename
