@@ -44,6 +44,8 @@ final class BackupManager: NSObject, ObservableObject, URLSessionDataDelegate {
     private var uploadContinuation: CheckedContinuation<Bool, Error>?
     private var responseBody = Data()
     private var stopRequested = false
+    /// 只提示一次「服务端未回时间确认字段」，避免刷屏。
+    private var timeAckWarned = false
     private var grace: UIBackgroundTaskIdentifier = .invalid
     private let pendingKey = "pendingUploadFile"
     private let pendingNameKey = "pendingUploadName"
@@ -97,6 +99,14 @@ final class BackupManager: NSObject, ObservableObject, URLSessionDataDelegate {
 
     func unhide(_ albumID: String) {
         hidden.remove(albumID)
+    }
+
+    /// 服务端上传响应里的时间确认值：数字或字符串都接受，缺字段返回 nil。
+    private static func creationDateAck(in json: [String: Any]?) -> Int64? {
+        guard let value = json?["creation_date_ms"] else { return nil }
+        if let number = value as? NSNumber { return number.int64Value }
+        if let text = value as? String { return Int64(text) }
+        return nil
     }
 
     func stop() {
@@ -591,12 +601,28 @@ final class BackupManager: NSObject, ObservableObject, URLSessionDataDelegate {
                 (200..<300).contains(response.statusCode) {
             let json = (try? JSONSerialization.jsonObject(with: responseBody)) as? [String: Any]
             let skipped = json?["skipped"] as? Bool == true
-            if !skipped,
-               let sent = (task.originalRequest ?? task.currentRequest)?.value(forHTTPHeaderField: "x-lincy-creation-date-ms"),
-               let expected = Int64(sent),
-               (json?["creation_date_ms"] as? NSNumber)?.int64Value != expected {
-                result = .failure(AppError.message("文件已接收，但服务端未确认保存原相册时间；请检查 Windows 服务端版本"))
-            } else { result = .success(skipped) }
+            let sentValue = (task.originalRequest ?? task.currentRequest)?
+                .value(forHTTPHeaderField: "x-lincy-creation-date-ms")
+            let ack = Self.creationDateAck(in: json)
+            if !skipped, let sent = sentValue, let expected = Int64(sent), let ackValue = ack {
+                // 服务端明确回了确认值：只有对不上才算失败。
+                if ackValue != expected {
+                    result = .failure(AppError.message(
+                        "服务端保存的原相册时间与发送值不一致（发送 \(expected)，服务端 \(ackValue)）"))
+                } else {
+                    result = .success(skipped)
+                }
+            } else if !skipped, sentValue != nil, ack == nil {
+                // 服务端没在响应里回确认字段（例如把时间写进 .lincy-photo-dates 并设置文件 mtime）：
+                // 文件已经接收，不再判失败，只提示一次。
+                if !timeAckWarned {
+                    timeAckWarned = true
+                    log("提示：服务端未在上传响应里回时间确认字段，原相册时间以服务器实际保存为准")
+                }
+                result = .success(skipped)
+            } else {
+                result = .success(skipped)
+            }
         } else {
             let code = (task.response as? HTTPURLResponse)?.statusCode ?? 0
             let body = String(data: responseBody.prefix(300), encoding: .utf8) ?? ""
