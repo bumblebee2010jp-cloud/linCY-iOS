@@ -205,10 +205,11 @@ final class BackupManager: NSObject, ObservableObject, URLSessionDataDelegate {
 
     // MARK: - 同名不同大小检查（只读，不改动任何文件）
 
-    /// 逐张把「服务器已存在」的文件导出到临时目录取字节数，再与服务端返回的大小比对。
-    /// 只走公开 API（PHAssetResourceManager 导出 + FileManager 读属性），与上传路径完全一致，
-    /// 不读任何私有属性、不覆盖、不删除服务器内容。
-    /// 代价是每张已存在文件都要导出一次，因此做成手动触发，显示进度，可随时停止。
+    /// 逐张把「服务器已存在」的文件导出到临时目录取字节数，再与服务器 HEAD 返回的 Content-Length 比对。
+    /// 只用公开 API：相册分页列表 + HEAD 取长度 + PHAssetResourceManager 导出。
+    /// 不覆盖、不删除服务器内容，可随时停止。
+    /// 相册目录清单走 /api/album/photos（与反向同步同一条路径），
+    /// 不再依赖 /api/upload-contents —— 那个接口列的是备份根，不是相册目录。
     @MainActor func scanConflicts(address: String, password: String, wifiOnly: Bool) async {
         guard !running, !scanning, !restoring else { return }
         let chosen = albums.filter { selected.contains($0.id) }
@@ -226,22 +227,24 @@ final class BackupManager: NSObject, ObservableObject, URLSessionDataDelegate {
         do {
             let server = try Server(address: address, wifiOnly: wifiOnly)
             let cookie = try await server.login(password: password)
+            let remoteAlbums = try await server.albums(cookie: cookie)
             let titleCounts = Dictionary(grouping: albums, by: { PhotoLibrary.safeName($0.title).lowercased() })
-            let known = Set(try await server.albums(cookie: cookie))
 
-            var plans: [(album: PhoneAlbum, folder: String, entries: [PhotoLibrary.BackupEntry])] = []
+            var plans: [(album: PhoneAlbum, remote: String, entries: [PhotoLibrary.BackupEntry])] = []
             var total = 0
             for album in chosen {
                 var folder = PhotoLibrary.safeName(album.title)
                 if (titleCounts[folder.lowercased()]?.count ?? 0) > 1 {
                     folder += "_" + PhotoLibrary.shortID(album.id)
                 }
-                guard known.contains(folder) else {
-                    log("\(album.title)：服务器上没有对应文件夹，跳过")
+                let remote = remoteAlbums.first { $0.caseInsensitiveCompare(folder) == .orderedSame }
+                    ?? remoteAlbums.first { $0.caseInsensitiveCompare(album.title) == .orderedSame }
+                guard let remote = remote else {
+                    log("\(album.title)：服务器上没有对应相册目录，跳过")
                     continue
                 }
                 let entries = PhotoLibrary.backupEntries(in: album.collection)
-                plans.append((album, folder, entries))
+                plans.append((album, remote, entries))
                 total += entries.count
             }
             guard total > 0 else {
@@ -250,30 +253,37 @@ final class BackupManager: NSObject, ObservableObject, URLSessionDataDelegate {
             }
 
             var done = 0
+            var matched = 0
+            var sized = 0
             for plan in plans {
                 try checkStop()
-                status = "读取服务器清单：\(plan.album.title)"
-                let index: Server.RemoteIndex
-                do {
-                    index = try await server.remoteIndex(album: plan.folder, cookie: cookie)
-                } catch {
-                    log("\(plan.album.title)：读取服务器清单失败 \(error.localizedDescription)")
-                    done += plan.entries.count
-                    continue
-                }
-                guard index.hasSizes else {
-                    log("\(plan.album.title)：服务端未返回文件大小，无法比对（需要新版服务端）")
-                    done += plan.entries.count
-                    continue
-                }
+                status = "读取服务器相册：\(plan.album.title)"
+                let items = try await remotePhotos(server: server, album: plan.remote, cookie: cookie)
+                let remoteNames = Set(items.map { $0.name })
+                log("\(plan.album.title)：服务器 \(items.count) 个文件（目录 \(plan.remote)）")
 
                 for entry in plan.entries {
                     try checkStop()
                     done += 1
                     scanProgress = Double(done) / Double(total)
-                    guard index.names.contains(entry.name),
-                          let remoteSize = index.sizes[entry.name] else { continue }
+                    guard remoteNames.contains(entry.name) else { continue }
+                    matched += 1
                     status = "比对 \(plan.album.title)：\(entry.name)（\(done)/\(total)）"
+
+                    let remoteSize: Int64?
+                    do {
+                        remoteSize = try await server.remoteFileSize(album: plan.remote,
+                            name: entry.name, cookie: cookie)
+                    } catch {
+                        log("读取服务器大小失败 \(entry.name)：\(error.localizedDescription)")
+                        continue
+                    }
+                    guard let remoteSize = remoteSize, remoteSize > 0 else {
+                        log("服务器未返回 \(entry.name) 的大小")
+                        continue
+                    }
+                    sized += 1
+
                     let temp = try exportURL()
                     defer { try? fileManager.removeItem(at: temp) }
                     do {
@@ -281,9 +291,9 @@ final class BackupManager: NSObject, ObservableObject, URLSessionDataDelegate {
                         let attrs = try fileManager.attributesOfItem(atPath: temp.path)
                         let localSize = (attrs[.size] as? NSNumber)?.int64Value ?? 0
                         if localSize != remoteSize {
-                            conflicts.append(BackupConflict(album: plan.folder, name: entry.name,
+                            conflicts.append(BackupConflict(album: plan.remote, name: entry.name,
                                 localSize: localSize, remoteSize: remoteSize))
-                            log("同名不同大小：\(plan.folder)/\(entry.name)")
+                            log("同名不同大小：\(plan.remote)/\(entry.name)")
                         }
                     } catch {
                         log("比对失败 \(entry.name)：\(error.localizedDescription)")
@@ -291,6 +301,7 @@ final class BackupManager: NSObject, ObservableObject, URLSessionDataDelegate {
                 }
             }
 
+            log("检查汇总：同名 \(matched) 个，读到服务器大小 \(sized) 个，不一致 \(conflicts.count) 个")
             status = conflicts.isEmpty
                 ? "检查完成：没有同名不同大小的文件"
                 : "检查完成：发现 \(conflicts.count) 个同名未覆盖"

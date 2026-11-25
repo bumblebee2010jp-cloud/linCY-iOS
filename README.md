@@ -14,6 +14,19 @@
 - 确认字段兼容数字与字符串两种写法。
 - 0.2.11 的只读「检查同名不同大小」保留：勾选相册 → 点按钮 → 逐张导出比对 → 列表 + 可复制清单。
 
+## 0.2.13 修正：检查同名不同大小永远报 0
+
+- 根因：相册目录不在「备份根」下。备份根是 `mobile.json` 的 `upload_dir`（如 `E:\iPhone15Pro\Backup`），
+  相册实际在 `album_dir`（如 `E:\iPhone15Pro\Video\Photos`）。
+  之前用 `/api/upload-contents?path=<相册名>` 查的是备份根，返回空清单，
+  所有文件都没进入比对，结果永远是 0。
+- 改用与反向同步同一条路径：`/api/album/photos?album=&offset=` 分页拿相册文件列表，
+  并用 `GET /api/albums` 的目录名做匹配（先按安全目录名，再按相册标题，大小写不敏感）。
+- 服务器端大小改为 `HEAD /api/album/photo?album=&name=` 读 `Content-Length`，
+  不再为了比大小把整张照片重新下载一遍。
+- 新增诊断日志：每个相册一行「服务器 N 个文件（目录 X）」，
+  结束时一行「检查汇总：同名 A 个，读到服务器大小 B 个，不一致 C 个」。
+
 编译 IPA：将源码放入 GitHub 仓库，在 Actions 中运行 unsigned-ipa 工作流；或使用 macOS/Xcode 打开 linCY.xcodeproj 编译。
 工作流产物为未签名 IPA，需按自己的证书签名后安装。
 本机仅完成工程结构检查，尚未进行 Xcode 编译和真机验证。

@@ -158,6 +158,22 @@ struct Server: @unchecked Sendable {
         return try JSONDecoder().decode(AlbumPage.self, from: data)
     }
 
+    /// HEAD /api/album/photo?album=&name= — 只取响应头，读取服务器端文件字节数。
+    /// 用 HEAD 避免为了比大小把整张照片再下载一遍；服务端不支持 HEAD 时返回 nil，由调用方记录。
+    func remoteFileSize(album: String, name: String, cookie: String) async throws -> Int64? {
+        var r = request("api/album/photo", query: [
+            URLQueryItem(name: "album", value: album),
+            URLQueryItem(name: "name", value: name)
+        ], cookie: cookie)
+        r.httpMethod = "HEAD"
+        let (_, response) = try await session.data(for: r)
+        guard let http = response as? HTTPURLResponse,
+              (200..<300).contains(http.statusCode) else { return nil }
+        guard let length = http.value(forHTTPHeaderField: "Content-Length"),
+              let value = Int64(length), value > 0 else { return nil }
+        return value
+    }
+
     /// GET /api/album/photo?album=&name= — 下载原始文件到指定位置。
     func downloadPhoto(album: String, name: String, cookie: String, to destination: URL) async throws -> Date? {
         let req = request("api/album/photo", query: [
