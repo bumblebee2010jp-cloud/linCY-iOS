@@ -1,0 +1,38 @@
+# Xcode
+build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+*.xcscmblueprint
+*.xccheckout
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# CocoaPods（本项目没有，留着防误提交）
+Pods/
+Podfile.lock
+
+# macOS
+.DS_Store
+
+# 脚本产物
+out/
+stage/
+Payload/
+__pycache__/
+*.pyc
+
+# 证书（不要提交）
+*.p12
+*.mobileprovision
+*.cer
+cert*
+zsign.exe
+signed/
